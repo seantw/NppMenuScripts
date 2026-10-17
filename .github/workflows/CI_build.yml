@@ -1,0 +1,68 @@
+name: CI_build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+
+    runs-on: windows-latest
+    env:
+      Projectname: NppMenuScripts
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - msys: UCRT64
+            env: ucrt-x86_64
+            arch: x86_64
+            configuration: Release
+            compiler: gcc
+          - msys: UCRT64
+            env: ucrt-x86_64
+            arch: x86_64
+            configuration: Debug
+            compiler: gcc
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v7
+
+    - name: Install and update MSYS2 tools
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: ${{ matrix.msys }}
+        install: mingw-w64-${{ matrix.env }}-${{ matrix.compiler }} mingw-w64-${{ matrix.env }}-make
+        update: true
+        release: false
+
+    - name: Build of plugin dll
+      working-directory: .\
+      run: |
+           Write-host "${{ matrix.msys }}"
+           Write-host "${{ matrix.configuration }}"
+           $Env:MSYSTEM = '${{ matrix.msys }}'
+           $Env:Path = 'C:\msys64\usr\bin' + [IO.Path]::PathSeparator + $Env:Path
+           $Env:Path = 'C:\msys64\' + '${{ matrix.msys }}'.ToLower() + '\bin' + [IO.Path]::PathSeparator + $Env:Path
+           if ( $${{ matrix.configuration == 'Debug'}} ) {$Env:DEBUG = '1'}
+           Write-Output "Tools version:"
+           Write-Output (((${{ matrix.compiler }} --version) | select-object -first 1) + " " + (${{ matrix.compiler }} -dumpmachine))
+           Write-Output (mingw32-make --version) | select-object -first 1
+           Write-Output (sh --version) | select-object -first 1
+           .\get-cjson.bat
+           .\build-x64.bat
+
+    - name: zip artifacts for ${{ matrix.msys }} / ${{ matrix.configuration }}
+      run: |
+           7z a ${{ env.Projectname }}_${{ matrix.arch }}_${{ matrix.configuration }}.zip .\build\${{ env.Projectname }}.dll
+
+    - name: Archive artifacts for Release ${{ matrix.arch }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.Projectname }}_${{ matrix.arch }}_${{ matrix.configuration }}.zip
+        path: ${{ env.Projectname }}_${{ matrix.arch }}_${{ matrix.configuration }}.zip
+
+    - name: Create release on tagging
+      uses: softprops/action-gh-release@v3
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: ${{ env.Projectname }}_${{ matrix.arch }}_${{ matrix.configuration }}.zip
