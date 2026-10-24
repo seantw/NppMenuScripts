@@ -32,7 +32,7 @@ jobs:
       with:
         msystem: ${{ matrix.msys }}
         install: mingw-w64-${{ matrix.env }}-${{ matrix.compiler }} mingw-w64-${{ matrix.env }}-make
-        update: true
+        update: false
         release: false
 
     - name: Build of plugin dll
