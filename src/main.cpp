@@ -15,6 +15,7 @@
 #include <functional>
 #include <cstring>
 #include <climits>
+#include <limits>
 #include <cwchar>
 #include <utility>
 #include <unordered_map>
@@ -39,7 +40,7 @@ extern "C" {
 static const wchar_t PLUGIN_NAME[] = L"NppMenuScripts";
 // Keep this synchronized with menu-helper.js. Change it only when helper API
 // compatibility changes, not for routine implementation fixes.
-static constexpr unsigned int HELPER_API_ID = 10;
+static constexpr unsigned int HELPER_API_ID = 12;
 static constexpr char HELPER_API_CHECK_PREFIX[] = "\x1eNPPMENUSCRIPTS_HELPER_API:";
 static NppData g_nppData{};
 static HMODULE g_hModule = nullptr;
@@ -90,6 +91,7 @@ static FuncItem g_funcItems[] = {
 static std::vector<FuncItem> g_allFuncItems;
 static std::vector<std::wstring> g_toolbarScriptFiles;
 static std::vector<MenuCommandAction> g_toolbarActions;
+static std::vector<std::wstring> g_toolbarActionTargets;
 static std::vector<ExecuteOptions> g_toolbarExecuteOptions;
 static std::vector<std::wstring> g_toolbarIconFiles;
 static std::vector<std::wstring> g_toolbarTitles;
@@ -204,6 +206,8 @@ static constexpr UINT SCI_POSITIONFROMLINE_LOCAL = 2167;
 static constexpr UINT SCI_FINDCOLUMN_LOCAL = 2456;
 static constexpr UINT SCI_VISIBLEFROMDOCLINE_LOCAL = 2220;
 static constexpr UINT SCI_SETFIRSTVISIBLELINE_LOCAL = 2613;
+static constexpr UINT SCI_SETXOFFSET_LOCAL = 2397;
+static constexpr UINT SCI_GETXOFFSET_LOCAL = 2398;
 static constexpr UINT SCI_GETLINEENDPOSITION_LOCAL = 2136;
 static constexpr UINT SCI_LINELENGTH_LOCAL = 2350;
 static constexpr UINT SCI_GETSELECTIONSTART_LOCAL = 2143;
@@ -298,13 +302,15 @@ static const std::wstring& tr(const char* key)
         {"CurrentFileUnsupported", L"Unsupported current file type: {extension}. Supported types are .js, .mjs, .pl, and .py."},
         {"CurrentFileModified", L"The current file has unsaved changes. Save it before running?"},
         {"CurrentFileSaveFailed", L"The current file could not be saved. The script was not run."},
+        {"MenuCommandFailed", L"The requested menu command could not be found or is unavailable."},
+        {"MenuCommandSelfInvoke", L"This toolbar action points to an NppMenuScripts command and would invoke itself. The action was not run."},
         {"EnvironmentValueTooLong", L"One or more environment variable values exceed the Windows limit. Truncate them and run the command?"},
         {"EnvironmentBlockTooLarge", L"The command environment is too large for Windows. Reduce its environment variables before running it."},
         {"UnableStartCommand", L"[NppMenuScripts] Unable to start the command. Error code: {error}\r\n"},
         {"MenuJsonEmpty", L"menu.json was not found or is empty."},
         {"JsonParseError", L"JSON parse error: {error}"},
-        {"InvalidMenuJson", L"menu.json must contain string 'script_folder' and object 'menu'. Menu items must be {title, script}, {title, action}, {title, execute}, {title, sub}, or an empty object for a separator. Use exactly one of 'script', 'action', or 'execute'; supported actions are '{RUN_CURRENT_FILE}' and '{STOP_SCRIPT}'."},
-        {"InvalidToolbarEntry", L"Each 'toolbar' entry needs string 'title' and exactly one of 'script', 'action', or 'execute'. 'icon' is optional. Scripts must use .js, .mjs, .pl, or .py; supported actions are '{RUN_CURRENT_FILE}' and '{STOP_SCRIPT}'."},
+        {"InvalidMenuJson", L"menu.json must contain string 'script_folder' and object 'menu'. Menu items must be {title, script}, {title, action}, {title, execute}, {title, sub}, or an empty object for a separator. Use exactly one of 'script', 'action', or 'execute'; supported actions are 'RUN_CURRENT_FILE', 'STOP_SCRIPT', or 'MENU:<command ID or menu path>'."},
+        {"InvalidToolbarEntry", L"Each 'toolbar' entry needs string 'title' and exactly one of 'script', 'action', or 'execute'. 'icon' is optional. Scripts must use .js, .mjs, .pl, or .py; supported actions are 'RUN_CURRENT_FILE', 'STOP_SCRIPT', or 'MENU:<command ID or menu path>'."},
         {"InvalidToolbarIcon", L"Toolbar icons must use the .ico format."},
         {"ToolbarLimit", L"A maximum of 32 toolbar buttons is supported."},
         {"AllocateMenuIdsFailed", L"Notepad++ could not allocate menu command IDs."},
@@ -2569,6 +2575,8 @@ static bool replaceCurrentLine(const std::wstring& text)
 {
     HWND sci = currentScintilla();
     if (!sci) return false;
+    const LRESULT firstVisibleLine = SendMessageW(sci, SCI_GETFIRSTVISIBLELINE_LOCAL, 0, 0);
+    const LRESULT xOffset = SendMessageW(sci, SCI_GETXOFFSET_LOCAL, 0, 0);
     const LRESULT position = SendMessageW(sci, SCI_GETCURRENTPOS_LOCAL, 0, 0);
     const LRESULT line = SendMessageW(sci, SCI_LINEFROMPOSITION_LOCAL, static_cast<WPARAM>(position), 0);
     const LRESULT start = SendMessageW(sci, SCI_POSITIONFROMLINE_LOCAL, static_cast<WPARAM>(line), 0);
@@ -2576,6 +2584,8 @@ static bool replaceCurrentLine(const std::wstring& text)
     const std::string utf8 = debugWideToUtf8(text);
     SendMessageW(sci, SCI_SETSEL_LOCAL, static_cast<WPARAM>(start), static_cast<LPARAM>(end));
     SendMessageW(sci, SCI_REPLACESEL_LOCAL, 0, reinterpret_cast<LPARAM>(utf8.c_str()));
+    SendMessageW(sci, SCI_SETFIRSTVISIBLELINE_LOCAL, static_cast<WPARAM>(firstVisibleLine), 0);
+    SendMessageW(sci, SCI_SETXOFFSET_LOCAL, static_cast<WPARAM>(xOffset), 0);
     return true;
 }
 
@@ -2600,8 +2610,12 @@ static bool replaceSelectionText(const std::wstring& text)
 {
     HWND sci = currentScintilla();
     if (!sci) return false;
+    const LRESULT firstVisibleLine = SendMessageW(sci, SCI_GETFIRSTVISIBLELINE_LOCAL, 0, 0);
+    const LRESULT xOffset = SendMessageW(sci, SCI_GETXOFFSET_LOCAL, 0, 0);
     const std::string utf8 = debugWideToUtf8(text);
     SendMessageW(sci, SCI_REPLACESEL_LOCAL, 0, reinterpret_cast<LPARAM>(utf8.c_str()));
+    SendMessageW(sci, SCI_SETFIRSTVISIBLELINE_LOCAL, static_cast<WPARAM>(firstVisibleLine), 0);
+    SendMessageW(sci, SCI_SETXOFFSET_LOCAL, static_cast<WPARAM>(xOffset), 0);
     return true;
 }
 
@@ -2628,10 +2642,14 @@ static bool replaceEntireText(const std::wstring& text)
 {
     HWND sci = currentScintilla();
     if (!sci) return false;
+    const LRESULT firstVisibleLine = SendMessageW(sci, SCI_GETFIRSTVISIBLELINE_LOCAL, 0, 0);
+    const LRESULT xOffset = SendMessageW(sci, SCI_GETXOFFSET_LOCAL, 0, 0);
     const std::string utf8 = debugWideToUtf8(text);
     const LRESULT length = SendMessageW(sci, SCI_GETTEXTLENGTH_LOCAL, 0, 0);
     SendMessageW(sci, SCI_SETSEL_LOCAL, 0, static_cast<LPARAM>(length));
     SendMessageW(sci, SCI_REPLACESEL_LOCAL, 0, reinterpret_cast<LPARAM>(utf8.c_str()));
+    SendMessageW(sci, SCI_SETFIRSTVISIBLELINE_LOCAL, static_cast<WPARAM>(firstVisibleLine), 0);
+    SendMessageW(sci, SCI_SETXOFFSET_LOCAL, static_cast<WPARAM>(xOffset), 0);
     return true;
 }
 
@@ -2692,7 +2710,79 @@ static bool handleClipboardProtocolLine(const std::string& line)
     static const std::string getPrefix = "\x1eNPPMENUSCRIPTS_GETCLIPBOARD:";
     static const std::string setPrefix = "\x1eNPPMENUSCRIPTS_SETCLIPBOARD:";
 
-    if (line == getPrefix) {
+    if (line == getPrefix || line == getPrefix + "TEXT" || line == getPrefix + "HTML") {
+        const bool wantHtml = line == getPrefix + "HTML";
+        if (wantHtml) {
+            const UINT htmlFormat = RegisterClipboardFormatW(L"HTML Format");
+            std::string html;
+            if (htmlFormat && OpenClipboard(g_nppData._nppHandle)) {
+                HANDLE data = GetClipboardData(htmlFormat);
+                if (data) {
+                    const SIZE_T size = GlobalSize(data);
+                    const char* bytes = static_cast<const char*>(GlobalLock(data));
+                    if (bytes && size > 0) {
+                        html.assign(bytes, static_cast<size_t>(size));
+                        GlobalUnlock(data);
+                    }
+                }
+                CloseClipboard();
+            }
+
+            auto parseOffset = [](std::string_view line, std::string_view key, size_t& result) {
+                if (line.substr(0, key.size()) != key) return false;
+                size_t at = key.size();
+                while (at < line.size() && (line[at] == ' ' || line[at] == '\t')) ++at;
+                if (at == line.size() || line[at] == '-') return false;
+                size_t value = 0;
+                bool hasDigit = false;
+                for (; at < line.size() && line[at] >= '0' && line[at] <= '9'; ++at) {
+                    const size_t digit = static_cast<size_t>(line[at] - '0');
+                    if (value > (std::numeric_limits<size_t>::max() - digit) / 10) return false;
+                    value = value * 10 + digit;
+                    hasDigit = true;
+                }
+                while (at < line.size() && (line[at] == ' ' || line[at] == '\t' || line[at] == '\r')) ++at;
+                if (!hasDigit || at != line.size()) return false;
+                result = value;
+                return true;
+            };
+
+            size_t startFragment = 0;
+            size_t endFragment = 0;
+            bool hasStart = false;
+            bool hasEnd = false;
+            size_t lineStart = 0;
+            while (!html.empty() && lineStart < html.size()) {
+                const size_t lineEnd = html.find('\n', lineStart);
+                const size_t end = lineEnd == std::string::npos ? html.size() : lineEnd;
+                const std::string_view headerLine(html.data() + lineStart, end - lineStart);
+                size_t parsed = 0;
+                if (parseOffset(headerLine, "StartFragment:", parsed)) {
+                    startFragment = parsed;
+                    hasStart = true;
+                } else if (parseOffset(headerLine, "EndFragment:", parsed)) {
+                    endFragment = parsed;
+                    hasEnd = true;
+                } else if (headerLine.empty() || headerLine[0] == '<' || headerLine.find(':') == std::string_view::npos) {
+                    break;
+                }
+                lineStart = lineEnd == std::string::npos ? html.size() : lineEnd + 1;
+            }
+
+            std::string fragment;
+            if (hasStart && hasEnd && startFragment <= endFragment && endFragment <= html.size()) {
+                fragment.assign(html, startFragment, endFragment - startFragment);
+            } else {
+                const size_t marker = html.find("<!--StartFragment");
+                const size_t markerEnd = marker == std::string::npos ? std::string::npos : html.find("-->", marker);
+                const size_t endMarker = markerEnd == std::string::npos ? std::string::npos : html.find("<!--EndFragment", markerEnd + 3);
+                if (markerEnd != std::string::npos && endMarker != std::string::npos)
+                    fragment.assign(html, markerEnd + 3, endMarker - (markerEnd + 3));
+            }
+            writeProtocolResponse("OK:" + encodeBase64(fragment) + "\n");
+            return true;
+        }
+
         std::wstring text;
         if (!OpenClipboard(g_nppData._nppHandle)) {
             writeProtocolResponse("ERROR\n");
@@ -2753,6 +2843,140 @@ static bool handleClipboardProtocolLine(const std::string& line)
     return false;
 }
 
+static bool isNppMenuScriptsCommand(UINT commandId)
+{
+    return std::find(g_cmdIds.begin(), g_cmdIds.end(), static_cast<int>(commandId)) != g_cmdIds.end();
+}
+
+static bool dispatchMenuCommandPath(const std::wstring& path, bool* selfReference = nullptr)
+{
+    if (selfReference) *selfReference = false;
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    while (start <= path.size()) {
+        const size_t separator = path.find(L'/', start);
+        std::wstring part = path.substr(start, separator == std::wstring::npos
+            ? std::wstring::npos : separator - start);
+        const size_t first = part.find_first_not_of(L" \t\r\n");
+        const size_t last = part.find_last_not_of(L" \t\r\n");
+        if (first == std::wstring::npos) return false;
+        parts.push_back(part.substr(first, last - first + 1));
+        if (separator == std::wstring::npos) break;
+        start = separator + 1;
+    }
+
+    auto normalizeMenuLabel = [](std::wstring label) {
+        const size_t tab = label.find(L'\t');
+        if (tab != std::wstring::npos) label.resize(tab);
+        while (!label.empty() && (label.back() == L' ' || label.back() == L'\t' ||
+                                  label.back() == L'\r' || label.back() == L'\n')) {
+            label.pop_back();
+        }
+        const size_t length = label.size();
+        if (length >= 4 && label[length - 4] == L'(' && label[length - 3] == L'&' &&
+            label[length - 1] == L')') {
+            label.resize(length - 4);
+        }
+        std::wstring normalized;
+        normalized.reserve(label.size());
+        for (size_t i = 0; i < label.size(); ++i) {
+            if (label[i] == L'&') {
+                if (i + 1 < label.size() && label[i + 1] == L'&') {
+                    normalized.push_back(L'&');
+                    ++i;
+                }
+                continue;
+            }
+            normalized.push_back(label[i]);
+        }
+        const size_t first = normalized.find_first_not_of(L" \t\r\n");
+        const size_t last = normalized.find_last_not_of(L" \t\r\n");
+        if (first == std::wstring::npos) return std::wstring();
+        return normalized.substr(first, last - first + 1);
+    };
+    auto labelsEqual = [](const std::wstring& left, const std::wstring& right) {
+        return CompareStringOrdinal(left.c_str(), static_cast<int>(left.size()),
+                                    right.c_str(), static_cast<int>(right.size()), TRUE) == CSTR_EQUAL;
+    };
+
+    HMENU currentMenu = reinterpret_cast<HMENU>(
+        SendMessageW(g_nppData._nppHandle, NPPM_GETMENUHANDLE, NPPMAINMENU, 0));
+    UINT commandId = 0;
+    bool found = currentMenu != nullptr;
+    for (size_t partIndex = 0; found && partIndex < parts.size(); ++partIndex) {
+        const std::wstring wanted = normalizeMenuLabel(parts[partIndex]);
+        int foundPosition = -1;
+        MENUITEMINFOW foundInfo{};
+        foundInfo.cbSize = sizeof(foundInfo);
+        for (int i = 0; i < GetMenuItemCount(currentMenu); ++i) {
+            const int labelLength = GetMenuStringW(currentMenu, static_cast<UINT>(i), nullptr, 0, MF_BYPOSITION);
+            if (labelLength <= 0) continue;
+            std::vector<wchar_t> labelBuffer(static_cast<size_t>(labelLength) + 1, L'\0');
+            if (GetMenuStringW(currentMenu, static_cast<UINT>(i), labelBuffer.data(),
+                               static_cast<int>(labelBuffer.size()), MF_BYPOSITION) == 0) continue;
+            if (!labelsEqual(normalizeMenuLabel(labelBuffer.data()), wanted)) continue;
+            if (foundPosition >= 0) { found = false; break; }
+            foundPosition = i;
+            foundInfo = {};
+            foundInfo.cbSize = sizeof(foundInfo);
+            foundInfo.fMask = MIIM_ID | MIIM_SUBMENU | MIIM_STATE | MIIM_FTYPE;
+            if (!GetMenuItemInfoW(currentMenu, static_cast<UINT>(i), TRUE, &foundInfo)) {
+                found = false;
+                break;
+            }
+        }
+        if (!found || foundPosition < 0 ||
+            (foundInfo.fState & (MFS_DISABLED | MFS_GRAYED)) != 0 ||
+            (foundInfo.fType & MFT_SEPARATOR) != 0) {
+            found = false;
+            break;
+        }
+        if (partIndex + 1 == parts.size()) {
+            if (foundInfo.hSubMenu || foundInfo.wID == 0) found = false;
+            else commandId = foundInfo.wID;
+        } else {
+            currentMenu = foundInfo.hSubMenu;
+            if (!currentMenu) found = false;
+        }
+    }
+    if (!found || commandId == 0) return false;
+    if (isNppMenuScriptsCommand(commandId)) {
+        if (selfReference) *selfReference = true;
+        return false;
+    }
+    SendMessageW(g_nppData._nppHandle, WM_COMMAND, MAKEWPARAM(commandId, 0), 0);
+    return true;
+}
+
+static bool dispatchMenuCommandId(int commandId, bool* selfReference = nullptr)
+{
+    if (selfReference) *selfReference = false;
+    if (commandId <= 0) return false;
+    if (isNppMenuScriptsCommand(static_cast<UINT>(commandId))) {
+        if (selfReference) *selfReference = true;
+        return false;
+    }
+    return SendMessageW(g_nppData._nppHandle, NPPM_MENUCOMMAND, 0,
+                        static_cast<LPARAM>(commandId)) != 0;
+}
+
+static bool dispatchMenuCommandTarget(const std::wstring& target, bool* selfReference = nullptr)
+{
+    if (selfReference) *selfReference = false;
+    if (target.empty()) return false;
+    bool digitsOnly = true;
+    int commandId = 0;
+    for (const wchar_t digit : target) {
+        if (digit < L'0' || digit > L'9' || commandId > (INT_MAX - (digit - L'0')) / 10) {
+            digitsOnly = false;
+            break;
+        }
+        commandId = commandId * 10 + (digit - L'0');
+    }
+    if (digitsOnly) return dispatchMenuCommandId(commandId, selfReference);
+    return dispatchMenuCommandPath(target, selfReference);
+}
+
 static bool handleRunMenuCommandProtocolLine(const std::string& line)
 {
     static const std::string prefix = "\x1eNPPMENUSCRIPTS_RUNMENUCOMMAND:";
@@ -2761,6 +2985,18 @@ static bool handleRunMenuCommandProtocolLine(const std::string& line)
     const std::string payload = line.substr(prefix.size());
     if (payload.empty()) {
         writeProtocolResponse("ERROR\n");
+        return true;
+    }
+
+    if (payload.rfind("PATH:", 0) == 0) {
+        bool decodedOk = false;
+        const std::string decodedPath = decodeBase64(payload.substr(5), decodedOk);
+        if (!decodedOk || decodedPath.empty() || decodedPath.find('\0') != std::string::npos) {
+            writeProtocolResponse("ERROR\n");
+            return true;
+        }
+
+        writeProtocolResponse(dispatchMenuCommandPath(utf8ToWide(decodedPath.c_str())) ? "OK\n" : "ERROR\n");
         return true;
     }
 
@@ -2777,9 +3013,7 @@ static bool handleRunMenuCommandProtocolLine(const std::string& line)
         return true;
     }
 
-    const LRESULT result = SendMessageW(g_nppData._nppHandle, NPPM_MENUCOMMAND, 0,
-                                        static_cast<LPARAM>(commandId));
-    writeProtocolResponse(result ? "OK\n" : "ERROR\n");
+    writeProtocolResponse(dispatchMenuCommandId(commandId) ? "OK\n" : "ERROR\n");
     return true;
 }
 
@@ -3903,6 +4137,18 @@ static void showScriptPath(int id, bool checkCtrlClick = true)
         return;
     }
 
+    if (action == MenuCommandAction::RunMenuCommand) {
+        const std::wstring& target = g_scriptPaths[static_cast<size_t>(index)];
+        bool selfReference = false;
+        if (!dispatchMenuCommandTarget(target, &selfReference)) {
+            debugLog(L"Menu action could not be resolved: MENU:" + target);
+            MessageBoxW(g_nppData._nppHandle,
+                        tr(selfReference ? "MenuCommandSelfInvoke" : "MenuCommandFailed").c_str(),
+                        L"NppMenuScripts", MB_OK | MB_ICONWARNING);
+        }
+        return;
+    }
+
     if (action == MenuCommandAction::RunCommand) {
         ExecuteOptions options = g_executeOptions[static_cast<size_t>(index)];
         std::wstring currentPath = getCurrentFilePath();
@@ -4373,8 +4619,9 @@ static bool addJsonMenu(HMENU menu, cJSON* obj, const std::wstring& folder, unsi
         } else if (actionItem) {
             if (!cJSON_IsString(actionItem)) return false;
             MenuCommandAction action{};
-            if (!parseActionToken(utf8ToWide(actionItem->valuestring), action) ||
-                !addMenuItem(menu, utf8ToWide(titleItem->valuestring), L"", action)) return false;
+            std::wstring target;
+            if (!parseActionToken(utf8ToWide(actionItem->valuestring), action, target) ||
+                !addMenuItem(menu, utf8ToWide(titleItem->valuestring), target, action)) return false;
         } else {
             ExecuteOptions options;
             if (!parseExecuteOptions(executeItem, options) ||
@@ -4409,8 +4656,9 @@ static bool validMenuItems(cJSON* items, unsigned int depth = 0)
             if (!cJSON_IsString(script) || !hasScriptExtension(utf8ToWide(script->valuestring))) return false;
         } else if (actionItem) {
             MenuCommandAction action{};
+            std::wstring target;
             if (!cJSON_IsString(actionItem) ||
-                !parseActionToken(utf8ToWide(actionItem->valuestring), action)) return false;
+                !parseActionToken(utf8ToWide(actionItem->valuestring), action, target)) return false;
         } else {
             ExecuteOptions options;
             if (!parseExecuteOptions(executeItem, options)) return false;
@@ -4533,6 +4781,7 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
     const std::wstring resolvedIconFolder = resolveScriptFolder(jsonPath, configuredIconFolder);
     std::vector<std::wstring> configuredToolbarScripts;
     std::vector<MenuCommandAction> configuredToolbarActions;
+    std::vector<std::wstring> configuredToolbarActionTargets;
     std::vector<ExecuteOptions> configuredToolbarExecuteOptions;
     std::vector<std::wstring> configuredToolbarIcons;
     std::vector<std::wstring> configuredToolbarTitles;
@@ -4553,6 +4802,7 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
             }
             MenuCommandAction action = MenuCommandAction::RunScript;
             std::wstring script;
+            std::wstring actionTarget;
             if (scriptItem) {
                 if (!cJSON_IsString(scriptItem)) {
                     cJSON_Delete(root);
@@ -4567,7 +4817,7 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
                 }
                 configuredToolbarExecuteOptions.emplace_back();
             } else if (actionItem && (!cJSON_IsString(actionItem) ||
-                       !parseActionToken(utf8ToWide(actionItem->valuestring), action))) {
+                       !parseActionToken(utf8ToWide(actionItem->valuestring), action, actionTarget))) {
                 cJSON_Delete(root);
                 MessageBoxW(g_nppData._nppHandle, tr("InvalidToolbarEntry").c_str(), L"NppMenuScripts", MB_OK | MB_ICONERROR);
                 return false;
@@ -4597,6 +4847,7 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
             }
             configuredToolbarScripts.push_back(script);
             configuredToolbarActions.push_back(action);
+            configuredToolbarActionTargets.push_back(std::move(actionTarget));
             configuredToolbarIcons.push_back(std::move(iconPath));
             configuredToolbarTitles.push_back(utf8ToWide(titleItem->valuestring));
         }
@@ -4609,6 +4860,7 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
     if (g_toolbarIconsRegistered) {
         if (configuredToolbarScripts != g_toolbarScriptFiles ||
             configuredToolbarActions != g_toolbarActions ||
+            configuredToolbarActionTargets != g_toolbarActionTargets ||
             configuredToolbarExecuteOptions != g_toolbarExecuteOptions ||
             configuredToolbarIcons != g_toolbarIconFiles) {
             debugLog(L"Toolbar configuration changed; restart Notepad++ for toolbar changes to take effect");
@@ -4616,6 +4868,7 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
     } else {
         g_toolbarScriptFiles = configuredToolbarScripts;
         g_toolbarActions = configuredToolbarActions;
+        g_toolbarActionTargets = configuredToolbarActionTargets;
         g_toolbarExecuteOptions = configuredToolbarExecuteOptions;
         g_toolbarIconFiles = configuredToolbarIcons;
         g_toolbarTitles = configuredToolbarTitles;
@@ -4680,7 +4933,8 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
     for (size_t i = 0; i < g_toolbarScriptFiles.size(); ++i) {
         const std::wstring& script = g_toolbarScriptFiles[i];
         const MenuCommandAction action = g_toolbarActions[i];
-        g_scriptPaths.push_back(action == MenuCommandAction::RunScript ? joinPath(folder, script) : L"");
+        g_scriptPaths.push_back(action == MenuCommandAction::RunScript ? joinPath(folder, script) :
+                                action == MenuCommandAction::RunMenuCommand ? g_toolbarActionTargets[i] : L"");
         g_scriptActions.push_back(action);
         g_scriptTitles.push_back(g_toolbarTitles[i]);
         g_executeOptions.push_back(g_toolbarExecuteOptions[i]);

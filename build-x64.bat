@@ -38,5 +38,17 @@ g++ -m64 -std=c++17 -Oz -ffunction-sections -fdata-sections -s -shared -static -
   -Wl,--gc-sections -luser32 -lgdi32 -lkernel32 -lcomdlg32 -lcomctl32 -lshell32 -lole32
 
 if errorlevel 1 exit /b %errorlevel%
+
+rem Stage the complete plugin payload with support files at the plugin root.
+for %%F in (i18n.json menu-helper.js MenuHelper.pm menu_helper.py package.json) do (
+  if not exist "support\%%F" (
+    echo Missing support\%%F
+    exit /b 1
+  )
+  copy /Y "support\%%F" build\ >nul
+  if errorlevel 1 exit /b 1
+)
+xcopy /E /I /Y workspace-template build\workspace-template >nul
+if errorlevel 2 exit /b %errorlevel%
 echo Built build\NppMenuScripts.dll (DEBUG=%DEBUG%)
 endlocal

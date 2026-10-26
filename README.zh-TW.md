@@ -90,7 +90,7 @@ Notepad++\
   },
   "toolbar": [
     { "icon": "hello.ico", "title": "Run Hello World",    "script": "hello-world.js" },
-    { "icon": "run.ico",   "title": "Run Current Script", "action": "{RUN_CURRENT_FILE}" },
+    { "icon": "run.ico",   "title": "Run Current Script", "action": "RUN_CURRENT_FILE" },
     { "icon": "calc.ico",  "title": "Open Calculator",    "execute": { "command": "calc.exe", "run_in": "windows" } }
   ]
 }
@@ -107,9 +107,10 @@ Notepad++\
   - `title`：(必要)「選單標題」或「工具列按鈕」的提示 (Tooltip)。若要設定快捷鍵，可加上 **Tab 字元** `\t` 和鍵盤快捷鍵名稱。
   - 執行動作 (必要) 有 `script`、`action` 或 `execute` 三種，只能指定其中一項：
     - `script`：值為字串，相對於 `script_folder` 的腳本檔案路徑，或絕對路徑。
-    - `action` 值為字串，外掛內建指令。目前有兩種： 
-      - `"{RUN_CURRENT_FILE}"` 代表執行目前編輯中的腳本。
-      - `"{STOP_SCRIPT}"` 代表停止執行中的腳本。
+    - `action` 值為字串，可設定外掛內建動作或 Notepad++ 選單指令。目前有三種：
+      - `"RUN_CURRENT_FILE"` 代表執行目前編輯中的腳本。
+      - `"STOP_SCRIPT"` 代表停止執行中的腳本。
+      - `"MENU:..."` 執行 Notepad++ 選單。可使用 [Item ID](https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/taiwaneseMandarin.xml) 或目前語系「選單路徑字串」。例如 `"MENU: 41001"` 或 `"MENU: 檔案/新增"`。
     - `execute` 物件值如下：
       - `command`：字串(必要)，命令列指令。
       - `run_in`：字串(必要)，執行方式。有下列三種：
@@ -237,9 +238,9 @@ NppMenuScripts 會將外掛資料夾加入 Perl 模組搜尋路徑，讓 Perl �
 #### 對話框
 | API | 回傳值 | 說明 |
 |---|---|---|
-| `alert(message, [title], [icon])` | `void` | 訊息對話框 |
-| `prompt(message, [defaultValue], [title], [icon])` | `string / null` | 提示使用者輸入文字；按取消時回傳 `null` |
-| `confirm(message, [title], [icon])` | `true / false` | 確認對話框 |
+| 💬`alert(message, [title], [icon])` | `void` | 訊息對話框 |
+| 💬`prompt(message, [defaultValue], [title], [icon])` | `string / null` | 提示使用者輸入文字；按取消時回傳 `null` |
+| 💬`confirm(message, [title], [icon])` | `true / false` | 確認對話框 |
 
 `icon` 可使用系統圖示名稱 `error`、`warning`、`info`、`question`，或簡寫 `x`、`!`、`i`、`?`；也可指定 `.ico` 檔名，從 `icon_folder` 設定的資料夾載入。
 
@@ -248,33 +249,35 @@ NppMenuScripts 會將外掛資料夾加入 Perl 模組搜尋路徑，讓 Perl �
 #### 編輯中的文字
 | API | 回傳值 | 說明 |
 |---|---|---|
-| `getLine()`<br>`setLine(text)` | `string / boolean` | 讀取或置換游標所在**列文字** |
-| `getSelection()`<br>`setSelection(text)`<br>`hasSelection()` | `string / boolean / boolean` | 讀取或置換目前**選取文字**；若沒有選取，則在游標處插入文字 |
-| `getText()`<br>`setText(text)` | `string / boolean` | 讀取或置換當前文件**全部文字** |
-| `getClipBoard()`<br>`setClipBoard(text)` | `string / boolean` | 讀取或設定**剪貼簿**文字 |
+| 📤`getLine()`<br>📥`setLine(text)` | `string / boolean` | 讀取或置換游標所在**列文字** |
+| 📤`getSelection()`<br>📥`setSelection(text)`<br>❓ `hasSelection()` | `string / boolean / boolean` | 讀取或置換目前**選取文字**。若沒有選取，則在游標處插入文字。 |
+| 📤`getText()`<br>📥`setText(text)` | `string / boolean` | 讀取或置換當前文件**全部文字** |
+| 📤`getClipBoard([format])`<br>📥`setClipBoard(text)` | `string / boolean` | 讀取或置換**剪貼簿**文字。<br>`format` 參數可為 `"HTML"`(非必要)，若剪貼簿非 HTML 格式則回傳空字串。 |
+
+
 
 #### 游標及捲軸
 | API | 回傳值 | 說明 |
 |---|---|---|
-| `getCursor()`<br>`setCursor(line, column)` | `{line: number, column: number} / boolean` | 取得或設定目前游標位置 (0 起算) |
-| `getScrollLine()`<br>`setScrollLine(line)` | `number / boolean` | 取得或設定編輯區捲動行號 (0 起算)；若在摺疊中會自動展開，若該行隱藏則回傳 `false` |
+| 📤`getCursor()`<br>📥`setCursor(line, column)` | `{line: number, column: number} / boolean` | 取得或設定目前游標位置 (0 起算) |
+| 📤`getScrollLine()`<br>📥`setScrollLine(line)` | `number / boolean` | 取得或設定編輯區捲動行號 (0 起算)；若在摺疊中會自動展開，若該行隱藏則回傳 `false` |
 
 #### 檔案
 | API | 回傳值 | 說明 |
 |---|---|---|
-| `getFileName()` | `string` | 取得目前文件完整路徑 |
-| `getOpenFiles()` | `string[]` | 回傳所有已開啟且有檔名的文件完整路徑 |
-| `openFile(fullPathFileName)` | `boolean` | 開啟檔案並切換至該文件 |
-| `openFileInBackground(fullPathFileName)` | `boolean` | 開啟檔案並保留目前作用中的文件 |
-| `saveFile()` | `boolean` | 儲存目前文件；成功回傳 `true`，若文件未命名或儲存失敗則回傳 `false` |
-| `closeFile(fullPathFileName)` | `boolean` | 關閉指定檔案；若使用者取消未儲存提示則回傳 `false` |
+| 📤`getFileName()` | `string` | 取得目前文件完整路徑 |
+| 📤`getOpenFiles()` | `string[]` | 回傳所有已開啟且有檔名的文件完整路徑 |
+| ⚡ `openFile(fullPathFileName)` | `boolean` | 開啟檔案並切換至該文件 |
+| ⚡ `openFileInBackground(fullPathFileName)` | `boolean` | 開啟檔案並保留目前作用中的文件 |
+| ⚡ `saveFile()` | `boolean` | 儲存目前文件；成功回傳 `true`，若文件未命名或儲存失敗則回傳 `false` |
+| ⚡ `closeFile(fullPathFileName)` | `boolean` | 關閉指定檔案；若使用者取消未儲存提示則回傳 `false` |
 
 #### 其他
 | API | 回傳值 | 說明 |
 |---|---|---|
-| `setStatusBarText(text)` | `boolean` | 設定 Notepad++ 狀態列文字 |
-| `setOutputPaneTitle(text)` | `boolean` | 設定「輸出面板」標題 |
-| `runMenuCommand(commandID)` | `boolean` | 依照 [taiwaneseMandarin.xml](https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/taiwaneseMandarin.xml) 中的 ID 執行 Notepad++ 選單指令 |
+| 📥`setStatusBarText(text)` | `boolean` | 設定 Notepad++ 狀態列文字 |
+| 📥`setOutputPaneTitle(text)` | `boolean` | 設定「輸出面板」標題 |
+| ⚡ `runMenu(command)` | `boolean` | 執行 Notepad++ 選單。`command`參數可使用 [Item ID](https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/taiwaneseMandarin.xml) 或目前語系「選單路徑字串」。例如：`41001` 或 `"檔案/新增"` |
 
 
 **注意事項：**
@@ -285,7 +288,7 @@ NppMenuScripts 會將外掛資料夾加入 Perl 模組搜尋路徑，讓 Perl �
 
 ## 多國語言
 
-多國語言檔位於 `NppMenuScripts.dll` 相同目錄下的 [`i18n.json`](i18n.json) 檔。Notepad++ 啟動時載入。依 Notepad++ 目前語系顯示。您可自行在此添加您的語言。
+多國語言檔位於 `NppMenuScripts.dll` 相同目錄下的 `i18n.json` 檔。Notepad++ 啟動時載入。依 Notepad++ 目前語系顯示。您可自行在此添加您的語言。原始檔位於 [`support/i18n.json`](support/i18n.json)。
 
 語言代碼請參考 [Notepad++ User Manual](https://npp-user-manual.org/docs/command-prompt/#langCodeList)，點擊 "show Language Codes" 展開。
 

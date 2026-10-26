@@ -87,7 +87,7 @@ Use [`menu.json`](./workspace-template/menu.json) to configure item titles and a
   },
   "toolbar": [
     { "icon": "hello.ico", "title": "Run Hello World",    "script": "hello-world.js" },
-    { "icon": "run.ico",   "title": "Run Current Script", "action": "{RUN_CURRENT_FILE}" },
+    { "icon": "run.ico",   "title": "Run Current Script", "action": "RUN_CURRENT_FILE" },
     { "icon": "calc.ico",  "title": "Open Calculator",    "execute": { "command": "calc.exe", "run_in": "windows" } }
   ]
 }
@@ -104,9 +104,10 @@ If you change `script_folder`, copy `menu-helper.js` and `package.json` to its p
   - `title` (required): The menu item label or toolbar button tooltip. To assign a keyboard shortcut, append a **tab character** `\t` followed by the shortcut name.
   - Choose exactly one of `script`, `action`, or `execute`:
     - `script`: A script file path, relative to `script_folder` or absolute.
-    - `action`: A built-in plugin command. The available actions are:
-      - `"{RUN_CURRENT_FILE}"` runs the script currently open in the editor.
-      - `"{STOP_SCRIPT}"` stops the running script.
+    - `action`: A built-in plugin action or Notepad++ menu command. The available actions are:
+      - `"RUN_CURRENT_FILE"` runs the script currently open in the editor.
+      - `"STOP_SCRIPT"` stops the running script.
+      - `"MENU:..."` runs a Notepad++ menu command. Use an [Item ID](https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/english.xml) or a menu path in the current UI language. For example, `"MENU: 41001"` or `"MENU: File/New"`.
     - `execute`: An object with the following properties:
       - `command` (required): The command line to run.
       - `run_in` (required): How to run it:
@@ -235,48 +236,48 @@ NppMenuScripts adds the plugin folder to Perl's module search path so Perl can l
 
 | API | Returns | Description |
 |---|---|---|
-| `alert(message, [title], [icon])` | `void` | Shows a message dialog. |
-| `prompt(message, [defaultValue], [title], [icon])` | `string / null` | Prompts the user for text. Returns `null` when cancelled. |
-| `confirm(message, [title], [icon])` | `true / false` | Shows a confirmation dialog. |
+| 💬`alert(message, [title], [icon])` | `void` | Shows a message dialog. |
+| 💬`prompt(message, [defaultValue], [title], [icon])` | `string / null` | Prompts the user for text. Returns `null` when cancelled. |
+| 💬`confirm(message, [title], [icon])` | `true / false` | Shows a confirmation dialog. |
 
 `icon` accepts the system icon names `error`, `warning`, `info`, and `question`, or the short forms `x`, `!`, `i`, and `?`. It can also be an `.ico` filename loaded from the folder configured by `icon_folder`.
 
-To provide `icon` while omitting earlier optional arguments, pass `undefined` in JavaScript, use the `icon=` keyword in Python, or pass `undef` in Perl.
+To provide `icon` while omitting earlier optional parameters, pass `undefined` in JavaScript, use the `icon=` keyword in Python, or pass `undef` in Perl.
 
 #### Current document text
 
 | API | Returns | Description |
 |---|---|---|
-| `getLine()`<br>`setLine(text)` | `string / boolean` | Gets or replaces the text on the current **line**. |
-| `getSelection()`<br>`setSelection(text)`<br>`hasSelection()` | `string / boolean / boolean` | Gets or replaces the **selected text**. If there is no selection, `setSelection()` inserts text at the cursor. |
-| `getText()`<br>`setText(text)` | `string / boolean` | Gets or replaces **all text** in the current document. |
-| `getClipBoard()`<br>`setClipBoard(text)` | `string / boolean` | Gets or sets **clipboard text**. |
+| 📤`getLine()`<br>📥`setLine(text)` | `string / boolean` | Gets or replaces the text on the current **line**. |
+| 📤`getSelection()`<br>📥`setSelection(text)`<br>❓ `hasSelection()` | `string / boolean / boolean` | Gets or replaces the **selected text**. If there is no selection, `setSelection()` inserts text at the cursor. |
+| 📤`getText()`<br>📥`setText(text)` | `string / boolean` | Gets or replaces **all text** in the current document. |
+| 📤`getClipBoard([format])`<br>📥`setClipBoard(text)` | `string / boolean` | Gets or replaces **clipboard text**.<br>The optional `format` parameter can be `"HTML"`. If the clipboard is not in HTML format, an empty string is returned. |
 
 #### Cursor and scrolling
 
 | API | Returns | Description |
 |---|---|---|
-| `getCursor()`<br>`setCursor(line, column)` | `{line: number, column: number} / boolean` | Gets or sets the cursor position (0-based). |
-| `getScrollLine()`<br>`setScrollLine(line)` | `number / boolean` | Gets or sets the editor scroll line (0-based). A folded section is expanded automatically; returns `false` if the line is hidden. |
+| 📤`getCursor()`<br>📥`setCursor(line, column)` | `{line: number, column: number} / boolean` | Gets or sets the cursor position (0-based). |
+| 📤`getScrollLine()`<br>📥`setScrollLine(line)` | `number / boolean` | Gets or sets the editor scroll line (0-based). A folded section is expanded automatically; returns `false` if the line is hidden. |
 
 #### Files
 
 | API | Returns | Description |
 |---|---|---|
-| `getFileName()` | `string` | Returns the full path of the current document. |
-| `getOpenFiles()` | `string[]` | Returns the full paths of all open, named documents. |
-| `openFile(fullPathFileName)` | `boolean` | Opens a file and switches to it. |
-| `openFileInBackground(fullPathFileName)` | `boolean` | Opens a file and keeps the current document active. |
-| `saveFile()` | `boolean` | Saves the current document. Returns `true` on success and `false` if the document is unnamed or saving fails. |
-| `closeFile(fullPathFileName)` | `boolean` | Closes the specified file. Returns `false` if the user cancels the unsaved-changes prompt. |
+| 📤`getFileName()` | `string` | Returns the full path of the current document. |
+| 📤`getOpenFiles()` | `string[]` | Returns the full paths of all open, named documents. |
+| ⚡ `openFile(fullPathFileName)` | `boolean` | Opens a file and switches to it. |
+| ⚡ `openFileInBackground(fullPathFileName)` | `boolean` | Opens a file and keeps the current document active. |
+| ⚡ `saveFile()` | `boolean` | Saves the current document. Returns `true` on success and `false` if the document is unnamed or saving fails. |
+| ⚡ `closeFile(fullPathFileName)` | `boolean` | Closes the specified file. Returns `false` if the user cancels the unsaved-changes prompt. |
 
 #### Other
 
 | API | Returns | Description |
 |---|---|---|
-| `setStatusBarText(text)` | `boolean` | Sets the Notepad++ status bar text. |
-| `setOutputPaneTitle(text)` | `boolean` | Sets the Output Pane title. |
-| `runMenuCommand(commandID)` | `boolean` | Runs a Notepad++ menu command using its ID from [`english.xml`](https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/english.xml). |
+| 📥`setStatusBarText(text)` | `boolean` | Sets the Notepad++ status bar text. |
+| 📥`setOutputPaneTitle(text)` | `boolean` | Sets the Output Pane title. |
+| ⚡ `runMenu(command)` | `boolean` | Runs a Notepad++ menu command. The `command` parameter accepts an [Item ID](https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/english.xml) or a menu path string in the current UI language. For example: `41001` or `"File/New"`. |
 
 **Notes:**
 
@@ -286,7 +287,7 @@ To provide `icon` while omitting earlier optional arguments, pass `undefined` in
 
 ## Multilingual support
 
-The language file is `i18n.json`, located in the same folder as `NppMenuScripts.dll`. It is loaded when Notepad++ starts and the interface follows the current Notepad++ language. You can add your own languages to this file.
+The language file is `i18n.json`, located in the same folder as `NppMenuScripts.dll`. It is loaded when Notepad++ starts and the interface follows the current Notepad++ language. You can add your own languages to this file. The source file is in [`support/i18n.json`](support/i18n.json).
 
 For language codes, see the [Notepad++ User Manual](https://npp-user-manual.org/docs/command-prompt/#langCodeList) and expand **show Language Codes**.
 

@@ -6,8 +6,8 @@ use Encode qw(encode decode FB_DEFAULT);
 use IO::Handle;
 use MIME::Base64 qw(encode_base64 decode_base64);
 
-our $VERSION = '10';
-my $HELPER_API_ID = '10';
+our $VERSION = '12';
+my $HELPER_API_ID = '12';
 my $HELPER_API_CHECK_PREFIX = "\x1eNPPMENUSCRIPTS_HELPER_API:";
 
 binmode STDIN, ':raw';
@@ -208,8 +208,17 @@ sub setText {
 }
 
 sub getClipBoard {
-    my ($self) = @_;
-    my $response = _request($self, "\x1eNPPMENUSCRIPTS_GETCLIPBOARD:");
+    my ($self, $format) = @_;
+    my $mode = '';
+    if (defined $format) {
+        return '' if ref($format);
+        $mode = uc($format);
+        $mode =~ s/\A\s+|\s+\z//g;
+        return '' unless $mode eq '' || $mode eq 'TEXT' || $mode eq 'HTML';
+        $mode = 'HTML' if $mode eq 'HTML';
+        $mode = '' if $mode eq 'TEXT';
+    }
+    my $response = _request($self, "\x1eNPPMENUSCRIPTS_GETCLIPBOARD:", $mode);
     return index($response, 'OK:') == 0 ? _from_base64(substr($response, 3)) : '';
 }
 
@@ -218,9 +227,16 @@ sub setClipBoard {
     return _request($self, "\x1eNPPMENUSCRIPTS_SETCLIPBOARD:", _base64($value)) eq 'OK' ? 1 : 0;
 }
 
-sub runMenuCommand {
+sub runMenu {
     my ($self, $command_id) = @_;
-    return _request($self, "\x1eNPPMENUSCRIPTS_RUNMENUCOMMAND:", $command_id) eq 'OK' ? 1 : 0;
+    my $value = defined($command_id) ? "$command_id" : '';
+    my $payload;
+    if ($value =~ /\A\s*([0-9]+)\s*\z/) {
+        $payload = $1;
+    } else {
+        $payload = 'PATH:' . _base64($value);
+    }
+    return _request($self, "\x1eNPPMENUSCRIPTS_RUNMENUCOMMAND:", $payload) eq 'OK' ? 1 : 0;
 }
 
 sub setStatusBarText {

@@ -5,7 +5,7 @@ import os
 import sys
 
 
-_HELPER_API_ID = "10"
+_HELPER_API_ID = "12"
 _HELPER_API_CHECK_PREFIX = "\x1eNPPMENUSCRIPTS_HELPER_API:"
 _api_checked = False
 
@@ -185,8 +185,16 @@ def setText(text):
     return _request("\x1eNPPMENUSCRIPTS_SETTEXT:", _encode(text)) == "OK"
 
 
-def getClipBoard():
-    response = _request("\x1eNPPMENUSCRIPTS_GETCLIPBOARD:")
+def getClipBoard(format=None):
+    if format is None:
+        mode = ""
+    elif isinstance(format, str) and format.strip().upper() in ("", "TEXT"):
+        mode = ""
+    elif isinstance(format, str) and format.strip().upper() == "HTML":
+        mode = "HTML"
+    else:
+        return ""
+    response = _request("\x1eNPPMENUSCRIPTS_GETCLIPBOARD:", mode)
     return _decode(response[3:]) if response.startswith("OK:") else ""
 
 
@@ -194,8 +202,18 @@ def setClipBoard(text):
     return _request("\x1eNPPMENUSCRIPTS_SETCLIPBOARD:", _encode(text)) == "OK"
 
 
-def runMenuCommand(commandID):
-    return _request("\x1eNPPMENUSCRIPTS_RUNMENUCOMMAND:", str(commandID)) == "OK"
+def runMenu(commandIDOrPath):
+    if isinstance(commandIDOrPath, bool):
+        payload = "INVALID"
+    elif isinstance(commandIDOrPath, int):
+        payload = str(commandIDOrPath)
+    elif isinstance(commandIDOrPath, str):
+        stripped = commandIDOrPath.strip()
+        is_ascii_number = bool(stripped) and all("0" <= char <= "9" for char in stripped)
+        payload = stripped if is_ascii_number else "PATH:" + _encode(commandIDOrPath)
+    else:
+        payload = "INVALID"
+    return _request("\x1eNPPMENUSCRIPTS_RUNMENUCOMMAND:", payload) == "OK"
 
 
 def setStatusBarText(text):

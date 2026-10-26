@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 
 // Keep this synchronized with HELPER_API_ID in src/main.cpp.
-const HELPER_API_ID = '10';
+const HELPER_API_ID = '12';
 const HELPER_API_CHECK_PREFIX = '\x1eNPPMENUSCRIPTS_HELPER_API:';
 const ALERT_PREFIX = '\x1eNPPMENUSCRIPTS_ALERT:';
 const PROMPT_PREFIX = '\x1eNPPMENUSCRIPTS_PROMPT:';
@@ -310,8 +310,18 @@ function setText(text) {
   return requestResponse(`${SETTEXT_PREFIX}${encoded}\n`).then((line) => line === 'OK');
 }
 
-function getClipBoard() {
-  return requestResponse(`${GETCLIPBOARD_PREFIX}\n`).then((line) => line.startsWith('OK:') ? Buffer.from(line.slice(3), 'base64').toString('utf8') : '');
+function clipboardMode(format) {
+  if (format == null) return '';
+  if (typeof format !== 'string') return null;
+  const normalized = format.trim().toUpperCase();
+  if (!normalized || normalized === 'TEXT') return '';
+  return normalized === 'HTML' ? 'HTML' : null;
+}
+
+function getClipBoard(format) {
+  const mode = clipboardMode(format);
+  if (mode === null) return Promise.resolve('');
+  return requestResponse(`${GETCLIPBOARD_PREFIX}${mode}\n`).then((line) => line.startsWith('OK:') ? Buffer.from(line.slice(3), 'base64').toString('utf8') : '');
 }
 
 function setClipBoard(text) {
@@ -319,8 +329,21 @@ function setClipBoard(text) {
   return requestResponse(`${SETCLIPBOARD_PREFIX}${encoded}\n`).then((line) => line === 'OK');
 }
 
-function runMenuCommand(commandID) {
-  return requestResponse(`${RUNMENUCOMMAND_PREFIX}${commandID}\n`).then((line) => line === 'OK');
+function menuCommandPayload(commandIDOrPath) {
+  if (typeof commandIDOrPath === 'number') {
+    return Number.isSafeInteger(commandIDOrPath) ? String(commandIDOrPath) : 'INVALID';
+  }
+  if (typeof commandIDOrPath === 'string') {
+    const trimmed = commandIDOrPath.trim();
+    if (/^[0-9]+$/.test(trimmed)) return trimmed;
+    return `PATH:${Buffer.from(commandIDOrPath, 'utf8').toString('base64')}`;
+  }
+  return 'INVALID';
+}
+
+function runMenu(commandIDOrPath) {
+  const payload = menuCommandPayload(commandIDOrPath);
+  return requestResponse(`${RUNMENUCOMMAND_PREFIX}${payload}\n`).then((line) => line === 'OK');
 }
 
 function setStatusBarText(text) {
@@ -455,8 +478,10 @@ function syncSetText(text) {
   return requestResponseSync(`${SETTEXT_PREFIX}${encoded}\n`) === 'OK';
 }
 
-function syncGetClipBoard() {
-  const line = requestResponseSync(`${GETCLIPBOARD_PREFIX}\n`);
+function syncGetClipBoard(format) {
+  const mode = clipboardMode(format);
+  if (mode === null) return '';
+  const line = requestResponseSync(`${GETCLIPBOARD_PREFIX}${mode}\n`);
   return line.startsWith('OK:') ? Buffer.from(line.slice(3), 'base64').toString('utf8') : '';
 }
 
@@ -465,8 +490,9 @@ function syncSetClipBoard(text) {
   return requestResponseSync(`${SETCLIPBOARD_PREFIX}${encoded}\n`) === 'OK';
 }
 
-function syncRunMenuCommand(commandID) {
-  return requestResponseSync(`${RUNMENUCOMMAND_PREFIX}${commandID}\n`) === 'OK';
+function syncRunMenu(commandIDOrPath) {
+  const payload = menuCommandPayload(commandIDOrPath);
+  return requestResponseSync(`${RUNMENUCOMMAND_PREFIX}${payload}\n`) === 'OK';
 }
 
 function syncSetStatusBarText(text) {
@@ -502,7 +528,7 @@ module.exports = {
   setText: syncSetText,
   getClipBoard: syncGetClipBoard,
   setClipBoard: syncSetClipBoard,
-  runMenuCommand: syncRunMenuCommand,
+  runMenu: syncRunMenu,
   setStatusBarText: syncSetStatusBarText,
   setOutputPaneTitle: syncSetOutputPaneTitle,
   promises: {
@@ -528,7 +554,7 @@ module.exports = {
     setText,
     getClipBoard,
     setClipBoard,
-    runMenuCommand,
+    runMenu,
     setStatusBarText,
     setOutputPaneTitle
   }

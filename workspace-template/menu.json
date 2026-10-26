@@ -61,7 +61,7 @@
         ]
       },
       {},
-      { "title": "Run Current Script", "action": "{RUN_CURRENT_FILE}" }
+      { "title": "Run Current Script", "action": "RUN_CURRENT_FILE" }
     ]
   },
   "toolbar": [
@@ -72,12 +72,12 @@
     },
     {
       "icon": "run.ico",
-      "action": "{RUN_CURRENT_FILE}",
+      "action": "RUN_CURRENT_FILE",
       "title": "Run Current Script"
     },
     {
       "icon": "stop.ico",
-      "action": "{STOP_SCRIPT}",
+      "action": "STOP_SCRIPT",
       "title": "Stop Script"
     }
   ]
