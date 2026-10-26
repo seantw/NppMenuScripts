@@ -106,12 +106,12 @@ Notepad++\
 - 每個「選單」與「工具」項目必需指定 `title` 及「執行動作」：
   - `title`：(必要)「選單標題」或「工具列按鈕」的提示 (Tooltip)。若要設定快捷鍵，可加上 **Tab 字元** `\t` 和鍵盤快捷鍵名稱。
   - 執行動作 (必要) 有 `script`、`action` 或 `execute` 三種，只能指定其中一項：
-    - `script`：值為字串，相對於 `script_folder` 的腳本檔案路徑，或絕對路徑。
+    - `script`：值為字串，相對於 `script_folder` 的腳本檔案路徑，或絕對路徑。副檔名支援 `.js`、`.mjs`、`.py`、`.pl`。
     - `action` 值為字串，可設定外掛內建動作或 Notepad++ 選單指令。目前有三種：
       - `"RUN_CURRENT_FILE"` 代表執行目前編輯中的腳本。
       - `"STOP_SCRIPT"` 代表停止執行中的腳本。
       - `"MENU:..."` 執行 Notepad++ 選單。可使用 [Item ID](https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/taiwaneseMandarin.xml) 或目前語系「選單路徑字串」。例如 `"MENU: 41001"` 或 `"MENU: 檔案/新增"`。
-    - `execute` 物件值如下：
+    - `execute` 物件。屬性如下：
       - `command`：字串(必要)，命令列指令。
       - `run_in`：字串(必要)，執行方式。有下列三種：
         - `output_pane`：直接將文字顯示在「輸出面板」。
