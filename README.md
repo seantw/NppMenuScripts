@@ -103,7 +103,7 @@ If you change `script_folder`, copy `menu-helper.js` and `package.json` to its p
 - Each menu item and toolbar item must have a `title` and one action:
   - `title` (required): The menu item label or toolbar button tooltip. To assign a keyboard shortcut, append a **tab character** `\t` followed by the shortcut name.
   - Choose exactly one of `script`, `action`, or `execute`:
-    - `script`: A string containing a script file path, relative to `script_folder` or absolute.
+    - `script`: A script file path, relative to `script_folder` or absolute. Supported extensions are `.js`, `.mjs`, `.py`, and `.pl`.
     - `action`: A built-in plugin action or Notepad++ menu command. The available actions are:
       - `"RUN_CURRENT_FILE"` runs the script currently open in the editor.
       - `"STOP_SCRIPT"` stops the running script.
