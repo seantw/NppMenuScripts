@@ -60,7 +60,7 @@ Notepad++\
 │        └─ script\
 │           ├─ hello-world.js
 │           ├─ hello-world.py
-│           ├─ test-execute.vbs
+│           ├─ test-execute.bat
 │           └─ test.js
 
 ```
@@ -120,11 +120,12 @@ Notepad++\
       - `save_before_run`：true/false。執行前自動儲存目前文件。
       - `code_page`：字串或數字。用於 Windows 終端機 (Console) 的字碼頁，或解析「輸出面板」的文字編碼。若未指定，預設為 `ANSI`。常見的有 `ANSI`、`UTF-8`、`UTF-16LE`，或直接指定[代碼頁編號](https://learn.microsoft.com/zh-tw/windows/win32/intl/code-page-identifiers)數字。
       - `env`：執行時附加的環境變數。
-      - 上述中的 `command` 及 `env` 可帶入目前文件相關變數：
+      - 上述中的 `command` 及 `env` 可帶入下列變數：
         - `{FILE_PATH}`：完整路徑檔名
         - `{FILE_NAME}`：檔名 (含副檔名)
         - `{FILE_DIR}`：文件所在路徑
         - `{FILE_EXT}`：副檔名
+        - `{SCRIPT_FOLDER}`：`script_folder` 設定的腳本資料夾完整路徑
         - `{LINE_TEXT}`：游標所在整列文字 (僅`env`可使用)
         - `{SELECT_TEXT}`：選取文字 (僅`env`可使用)
   - `icon`：工具列按鈕圖示檔 .ico。尺寸為 32×32 像素、具備 32 位元色彩深度 (支援全彩與透明度)。僅在 `toolbar` 內有作用。

@@ -3731,10 +3731,12 @@ static bool prepareExecuteOptions(ExecuteOptions& options, const std::wstring& c
     const wchar_t* pathTokens[] = {L"{FILE_PATH}", L"{FILE_NAME}", L"{FILE_DIR}", L"{FILE_EXT}"};
     for (size_t i = 0; i < std::size(pathTokens); ++i)
         replaceExecuteVariable(options.command, pathTokens[i], pathValues[i]);
+    replaceExecuteVariable(options.command, L"{SCRIPT_FOLDER}", g_scriptFolder);
 
     const std::unordered_map<std::wstring, std::wstring> values = {
         {L"{FILE_PATH}", currentPath}, {L"{FILE_NAME}", fileName},
         {L"{FILE_DIR}", fileDir}, {L"{FILE_EXT}", fileExt},
+        {L"{SCRIPT_FOLDER}", g_scriptFolder},
         {L"{LINE_TEXT}", getCurrentLineText()}, {L"{SELECT_TEXT}", getSelectionText()}
     };
     std::unordered_map<std::wstring, std::wstring> emptyValues;
@@ -3869,19 +3871,30 @@ static void runNodeScript(const std::wstring& path, const std::wstring& menuTitl
                 command = L"cmd.exe /d /s /k \"chcp " + std::to_wstring(executeOptions.codePage) +
                     L" >nul & " + command + L"\"";
             } else {
+                size_t commandStart = command.find_first_not_of(L" \t");
+                if (commandStart == std::wstring::npos) commandStart = command.size();
+                bool hasCallPrefix = false;
+                if (_wcsnicmp(command.c_str() + commandStart, L"call", 4) == 0 &&
+                    (commandStart + 4 == command.size() || command[commandStart + 4] == L' ' ||
+                     command[commandStart + 4] == L'\t')) {
+                    hasCallPrefix = true;
+                    commandStart = command.find_first_not_of(L" \t", commandStart + 4);
+                    if (commandStart == std::wstring::npos) commandStart = command.size();
+                }
+                const bool quotedExecutable = commandStart < command.size() && command[commandStart] == L'"';
                 size_t executableEnd = std::wstring::npos;
-                if (!command.empty() && command.front() == L'"')
-                    executableEnd = command.find(L'"', 1);
+                if (quotedExecutable)
+                    executableEnd = command.find(L'"', commandStart + 1);
                 else
-                    executableEnd = command.find_first_of(L" \t");
-                const size_t executableStart = !command.empty() && command.front() == L'"' ? 1 : 0;
+                    executableEnd = command.find_first_of(L" \t", commandStart);
+                const size_t executableStart = commandStart + (quotedExecutable ? 1 : 0);
                 const std::wstring executable = command.substr(executableStart,
                     executableEnd == std::wstring::npos ? executableEnd : executableEnd - executableStart);
                 std::wstring lowerExecutable = executable;
                 std::transform(lowerExecutable.begin(), lowerExecutable.end(), lowerExecutable.begin(), ::towlower);
                 if ((lowerExecutable.size() >= 4 && lowerExecutable.rfind(L".bat") == lowerExecutable.size() - 4) ||
                     (lowerExecutable.size() >= 4 && lowerExecutable.rfind(L".cmd") == lowerExecutable.size() - 4))
-                    command = L"cmd.exe /d /s /c \"\"" + command + L"\"";
+                    command = L"cmd.exe /d /s /c \"\"" + (hasCallPrefix ? command.substr(commandStart) : command) + L"\"";
             }
         } else if (isPerl) {
             command = L"perl.exe -I " + quoteCommandArg(directoryName(scriptFolder)) +

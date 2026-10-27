@@ -26,7 +26,7 @@
           {
             "title": "Run Command with Output Pane",
             "execute": {
-              "command": "cscript.exe //nologo \"{FILE_PATH}\" \"{FILE_NAME}\"",
+              "command": "call \"{SCRIPT_FOLDER}\\test-execute.bat\"",
               "save_before_run": true,
               "code_page": "ANSI",
               "run_in": "output_pane",
@@ -40,9 +40,9 @@
           {
             "title": "Run Command in Console",
             "execute": {
-              "command": "cscript.exe //nologo \"{FILE_PATH}\" \"{FILE_NAME}\"",
+              "command": "call \"{SCRIPT_FOLDER}\\test-execute.bat\"",
               "save_before_run": true,
-              "code_page": "ANSI",
+              "code_page": "UTF-8",
               "run_in": "console",
               "env": {
                 "NMS_FILE_NAME": "{FILE_NAME}",

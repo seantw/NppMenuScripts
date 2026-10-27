@@ -59,7 +59,7 @@ Notepad++\
 │        └─ script\
 │           ├─ hello-world.js
 │           ├─ hello-world.py
-│           ├─ test-execute.vbs
+│           ├─ test-execute.bat
 │           └─ test.js
 ```
 
@@ -117,11 +117,12 @@ If you change `script_folder`, copy `menu-helper.js` and `package.json` to its p
       - `save_before_run`: `true` or `false`. Saves the active document before running.
       - `code_page`: A string or number. Sets the code page for the Windows Console or the text encoding used to parse Output Pane output. The default is `ANSI`. Common values include `ANSI`, `UTF-8`, and `UTF-16LE`; you can also specify a [Windows code page identifier](https://learn.microsoft.com/en-us/windows/win32/intl/code-page-identifiers).
       - `env`: Environment variables added when running the command.
-      - The `command` and `env` values can use placeholders for the active document:
+      - The `command` and `env` values can use the following placeholders:
         - `{FILE_PATH}`: Full file path
         - `{FILE_NAME}`: File name, including extension
         - `{FILE_DIR}`: Folder containing the file
         - `{FILE_EXT}`: File extension
+        - `{SCRIPT_FOLDER}`: Full path to the script folder configured by `script_folder`
         - `{LINE_TEXT}`: Text on the current line (available in `env` only)
         - `{SELECT_TEXT}`: Selected text (available in `env` only)
   - `icon`: A toolbar button icon file in `.ico` format, 32×32 pixels with 32-bit color depth (full color and transparency). This property only applies to `toolbar` items.
