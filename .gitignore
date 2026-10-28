@@ -47,3 +47,6 @@ Thumbs.db
 # Downloaded third-party source
 third_party/cJSON.c
 third_party/cJSON.h
+
+# Local Codex project instructions
+AGENTS.md

@@ -136,6 +136,7 @@ Notepad++\
 - 修改並儲存 menu.json 後可選擇「外掛選單」重建選單與工具列，不需重啟 Notepad++ 即可審視設定結果。
 - 按住 Ctrl 並點擊自訂的「選單項目」或「工具列按鈕」，可直接開啟對應腳本進行編輯；檔案不存在時可選擇建立範本。
 - 可從「外掛選單」選擇「停止腳本」，強制終止正在執行的腳本及由它啟動、受管理的子程序。
+- NppMenuScript 功能強大，如果你在 Notepad++ 啟動時不想看到主選單的「工具」、「巨集」及「執行」，你可以在 `menu.json` 加入欲隱藏的 [menuId](https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/taiwaneseMandarin.xml)，像這樣 `"hide_main_menus": ["tools", "macro", "run"]`。你完全可以透過 NppMenuScript 自行撰寫出自己想要的功能。
 
 
 ### 鍵盤快捷鍵

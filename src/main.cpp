@@ -97,6 +97,7 @@ static std::vector<std::wstring> g_toolbarIconFiles;
 static std::vector<std::wstring> g_toolbarTitles;
 static std::vector<toolbarIconsWithDarkMode> g_toolbarIcons;
 static bool g_toolbarIconsRegistered = false;
+static bool g_toolbarRestartRequired = false;
 static int g_menuScriptCount = 0;
 
 static HMENU g_mainMenu = nullptr;
@@ -109,6 +110,13 @@ static std::vector<std::wstring> g_scriptTitles;
 static std::vector<MenuCommandAction> g_scriptActions;
 static std::vector<ExecuteOptions> g_executeOptions;
 static bool g_installed = false;
+static bool g_nppReady = false;
+static bool g_hiddenMainMenusApplied = false;
+static std::vector<std::wstring> g_hiddenMainMenuIds;
+static std::vector<ACCEL> g_hotkeyAccelerators;
+static std::vector<int> g_hotkeyCommandIds;
+static HACCEL g_hotkeyAccelTable = nullptr;
+static HHOOK g_hotkeyMessageHook = nullptr;
 static HWND g_hotkeyWnd = nullptr;
 static const wchar_t HOTKEY_CLASS_NAME[] = L"NppMenuScripts_HotkeyWindow";
 
@@ -173,6 +181,10 @@ struct RunStatePayload {
 
 static LRESULT CALLBACK hotkeyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static bool createHotkeyWindow();
+static LRESULT CALLBACK hotkeyMessageHookProc(int code, WPARAM wParam, LPARAM lParam);
+static void installHotkeyMessageHook();
+static void removeHotkeyMessageHook();
+static bool rebuildHotkeyAcceleratorTable();
 static void destroyHotkeyWindow();
 static LRESULT CALLBACK outputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static bool createOutputPane();
@@ -281,6 +293,7 @@ static const std::wstring& tr(const char* key)
         {"ExternalCommandFailed", L"External command failed"},
         {"ExternalCommandStopped", L"External command stopped"},
         {"MenuRebuilt", L"Rebuilt: {path}"},
+        {"ToolbarRestartRequired", L"Restart Notepad++ for toolbar changes to take effect."},
         {"PleaseWaitSetWorkspacePath", L"Please wait until the current script has finished before changing the workspace folder."},
         {"PleaseWait", L"Please wait until the current script has finished."},
         {"PleaseWaitRebuild", L"Please wait until the current script has finished before rebuilding the menu."},
@@ -309,7 +322,7 @@ static const std::wstring& tr(const char* key)
         {"UnableStartCommand", L"[NppMenuScripts] Unable to start the command. Error code: {error}\r\n"},
         {"MenuJsonEmpty", L"menu.json was not found or is empty."},
         {"JsonParseError", L"JSON parse error: {error}"},
-        {"InvalidMenuJson", L"menu.json must contain string 'script_folder' and object 'menu'. Menu items must be {title, script}, {title, action}, {title, execute}, {title, sub}, or an empty object for a separator. Use exactly one of 'script', 'action', or 'execute'; supported actions are 'RUN_CURRENT_FILE', 'STOP_SCRIPT', or 'MENU:<command ID or menu path>'."},
+        {"InvalidMenuJson", L"menu.json must contain string 'script_folder' and object 'menu'. Optional 'hide_main_menus' must be an array of menuId strings. Menu items must be {title, script}, {title, action}, {title, execute}, {title, sub}, or an empty object for a separator. Use exactly one of 'script', 'action', or 'execute'; supported actions are 'RUN_CURRENT_FILE', 'STOP_SCRIPT', or 'MENU:<command ID or menu path>'."},
         {"InvalidToolbarEntry", L"Each 'toolbar' entry needs string 'title' and exactly one of 'script', 'action', or 'execute'. 'icon' is optional. Scripts must use .js, .mjs, .pl, or .py; supported actions are 'RUN_CURRENT_FILE', 'STOP_SCRIPT', or 'MENU:<command ID or menu path>'."},
         {"InvalidToolbarIcon", L"Toolbar icons must use the .ico format."},
         {"ToolbarLimit", L"A maximum of 32 toolbar buttons is supported."},
@@ -825,9 +838,25 @@ static bool parseHotkey(const std::wstring& title, UINT& modifiers, UINT& key)
         if (plus == std::wstring::npos) break;
         start = plus + 1;
     }
-    // RegisterHotKey with no modifiers captures the key globally. Require an
-    // explicit modifier so a plain Tab (or any other bare key) stays usable.
+    // Require an explicit modifier so a plain Tab (or any other bare key)
+    // does not replace normal Notepad++ editing behavior.
     return key != 0 && modifiers != 0;
+}
+
+static bool rebuildHotkeyAcceleratorTable()
+{
+    HACCEL replacement = nullptr;
+    if (!g_hotkeyAccelerators.empty()) {
+        replacement = CreateAcceleratorTableW(g_hotkeyAccelerators.data(),
+                                               static_cast<int>(g_hotkeyAccelerators.size()));
+        if (!replacement) {
+            debugLog(L"CreateAcceleratorTableW failed error=" + std::to_wstring(GetLastError()));
+            return false;
+        }
+    }
+    if (g_hotkeyAccelTable) DestroyAcceleratorTable(g_hotkeyAccelTable);
+    g_hotkeyAccelTable = replacement;
+    return true;
 }
 
 static void registerHotkeyForItem(const std::wstring& title, int id)
@@ -838,30 +867,94 @@ static void registerHotkeyForItem(const std::wstring& title, int id)
             debugLog(L"Hotkey parse failed title='" + title + L"'");
         return;
     }
-    if (!g_hotkeyWnd) {
-        debugLog(L"Hotkey registration skipped (window unavailable) title='" + title + L"'");
+    const size_t hotkeyIndex = g_hotkeyCommandIds.size();
+    if (hotkeyIndex > 0xFFFF) {
+        debugLog(L"Hotkey skipped because accelerator table limit was reached: '" + title + L"'");
         return;
     }
-    SetLastError(ERROR_SUCCESS);
-    if (!RegisterHotKey(g_hotkeyWnd, id, modifiers, key)) {
-        const DWORD error = GetLastError();
-        const std::wstring message = L"RegisterHotKey failed for '" + title +
-            L"' (id=" + std::to_wstring(id) + L", modifiers=" + std::to_wstring(modifiers) +
-            L", key=" + std::to_wstring(key) + L", error=" + std::to_wstring(error) + L")";
-        OutputDebugStringW(message.c_str());
-        debugLog(message);
-    } else {
-        debugLog(L"RegisterHotKey succeeded for '" + title + L"' (id=" +
-                 std::to_wstring(id) + L", modifiers=" + std::to_wstring(modifiers) +
-                 L", key=" + std::to_wstring(key) + L")");
+
+    ACCEL accelerator{};
+    accelerator.fVirt = FVIRTKEY;
+    if (modifiers & MOD_CONTROL) accelerator.fVirt |= FCONTROL;
+    if (modifiers & MOD_SHIFT) accelerator.fVirt |= FSHIFT;
+    if (modifiers & MOD_ALT) accelerator.fVirt |= FALT;
+    accelerator.key = static_cast<WORD>(key);
+    accelerator.cmd = static_cast<WORD>(hotkeyIndex);
+    g_hotkeyAccelerators.push_back(accelerator);
+    g_hotkeyCommandIds.push_back(id);
+    if (!rebuildHotkeyAcceleratorTable()) {
+        g_hotkeyAccelerators.pop_back();
+        g_hotkeyCommandIds.pop_back();
+        return;
     }
+    debugLog(L"Added NPP-thread accelerator for '" + title + L"' (slot=" +
+             std::to_wstring(hotkeyIndex) + L", command=" + std::to_wstring(id) +
+             L", modifiers=" + std::to_wstring(modifiers) +
+             L", key=" + std::to_wstring(key) + L")");
 }
 
 static void unregisterHotkeys()
 {
-    if (!g_hotkeyWnd) return;
-    for (size_t i = 0; i < g_scriptPaths.size(); ++i)
-        UnregisterHotKey(g_hotkeyWnd, g_cmdBase + static_cast<int>(i));
+    g_hotkeyAccelerators.clear();
+    g_hotkeyCommandIds.clear();
+    if (g_hotkeyAccelTable) DestroyAcceleratorTable(g_hotkeyAccelTable);
+    g_hotkeyAccelTable = nullptr;
+}
+
+static LRESULT CALLBACK hotkeyMessageHookProc(int code, WPARAM wParam, LPARAM lParam)
+{
+    if (code == HC_ACTION && lParam) {
+        MSG* message = reinterpret_cast<MSG*>(lParam);
+        const bool keyMessage = message->message == WM_KEYDOWN || message->message == WM_SYSKEYDOWN;
+        const HWND foreground = GetForegroundWindow();
+        const bool nppForeground = g_nppData._nppHandle && foreground == g_nppData._nppHandle;
+        if (keyMessage && wParam == PM_REMOVE) {
+            const bool controlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            const bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            const bool altDown = (GetKeyState(VK_MENU) & 0x8000) != 0 ||
+                                 (message->message == WM_SYSKEYDOWN &&
+                                  (static_cast<ULONG_PTR>(message->lParam) & (ULONG_PTR{1} << 29)) != 0);
+            if (g_hotkeyWnd && nppForeground) {
+                for (const ACCEL& accelerator : g_hotkeyAccelerators) {
+                    const bool requiresControl = (accelerator.fVirt & FCONTROL) != 0;
+                    const bool requiresShift = (accelerator.fVirt & FSHIFT) != 0;
+                    const bool requiresAlt = (accelerator.fVirt & FALT) != 0;
+                    if (message->wParam != accelerator.key ||
+                        controlDown != requiresControl || shiftDown != requiresShift || altDown != requiresAlt)
+                        continue;
+                    const WPARAM commandSlot = accelerator.cmd;
+                    if (PostMessageW(g_hotkeyWnd, WM_COMMAND, commandSlot, 0)) {
+                        message->message = WM_NULL;
+                        debugLog(L"NPP-thread hotkey matched key=" + std::to_wstring(accelerator.key) +
+                                 L" slot=" + std::to_wstring(commandSlot));
+                    } else {
+                        debugLog(L"Failed to queue hotkey command slot=" + std::to_wstring(commandSlot) +
+                                 L" error=" + std::to_wstring(GetLastError()));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    return CallNextHookEx(g_hotkeyMessageHook, code, wParam, lParam);
+}
+
+static void installHotkeyMessageHook()
+{
+    if (g_hotkeyMessageHook || !g_nppData._nppHandle) return;
+    const DWORD threadId = GetWindowThreadProcessId(g_nppData._nppHandle, nullptr);
+    if (!threadId) return;
+    g_hotkeyMessageHook = SetWindowsHookExW(WH_GETMESSAGE, hotkeyMessageHookProc, nullptr, threadId);
+    debugLog(L"NPP-thread keyboard hook installed=" +
+             std::to_wstring(g_hotkeyMessageHook != nullptr));
+}
+
+static void removeHotkeyMessageHook()
+{
+    if (!g_hotkeyMessageHook) return;
+    UnhookWindowsHookEx(g_hotkeyMessageHook);
+    g_hotkeyMessageHook = nullptr;
+    debugLog(L"NPP-thread keyboard hook removed");
 }
 
 static bool createHotkeyWindow()
@@ -1017,7 +1110,10 @@ static void rebuildMenu()
     if (!installMenus(path, true)) {
         installMenus(path, false);
     } else {
-        setNppStatusText(trFormat("MenuRebuilt", {{L"{path}", g_menuJsonPath}}));
+        if (g_toolbarRestartRequired)
+            setNppStatusText(tr("ToolbarRestartRequired"));
+        else
+            setNppStatusText(trFormat("MenuRebuilt", {{L"{path}", g_menuJsonPath}}));
     }
 }
 
@@ -4232,15 +4328,10 @@ static void showScriptPath(int id, bool checkCtrlClick = true)
 
 static LRESULT CALLBACK hotkeyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    if (msg == WM_HOTKEY) {
-        const int id = static_cast<int>(wParam);
-        debugLog(L"WM_HOTKEY received id=" + std::to_wstring(id) +
-                 L" modifiers=" + std::to_wstring(LOWORD(lParam)) +
-                 L" key=" + std::to_wstring(HIWORD(lParam)));
-        if (id >= g_cmdBase && id < g_cmdBase + g_cmdCount) {
-            // WM_HOTKEY is dispatched while its modifier is still down; do
-            // not mistake Ctrl+E for the menu's Ctrl+click editing gesture.
-            showScriptPath(id, false);
+    if (msg == WM_COMMAND) {
+        const size_t hotkeyIndex = LOWORD(wParam);
+        if (hotkeyIndex < g_hotkeyCommandIds.size()) {
+            showScriptPath(g_hotkeyCommandIds[hotkeyIndex], false);
             return 0;
         }
     } else if (msg == WM_NPPMENUSCRIPTS_REFRESH_LANGUAGE) {
@@ -4729,6 +4820,61 @@ static int findHelpMenuPosition(HMENU menu)
     return -1;
 }
 
+static int mainMenuEntryPosition(const std::wstring& menuId)
+{
+    // Keep this order aligned with Menu > Main > Entries in Notepad++ english.xml.
+    static const wchar_t* menuIds[] = {
+        L"file", L"edit", L"search", L"view", L"encoding", L"language",
+        L"settings", L"tools", L"macro", L"run", L"Plugins", L"Window"
+    };
+    for (size_t i = 0; i < std::size(menuIds); ++i)
+        if (menuId == menuIds[i]) return static_cast<int>(i);
+    return -1;
+}
+
+static void hideConfiguredMainMenus()
+{
+    if (!g_nppReady || !g_mainMenu || g_hiddenMainMenusApplied) return;
+
+    std::vector<std::pair<int, std::wstring>> positions;
+    for (const auto& menuId : g_hiddenMainMenuIds) {
+        const int position = mainMenuEntryPosition(menuId);
+        if (position < 0) {
+            debugLog(L"Unknown main menuId in hide_main_menus: '" + menuId + L"'");
+            continue;
+        }
+        positions.emplace_back(position, menuId);
+    }
+    std::sort(positions.begin(), positions.end(),
+              [](const auto& left, const auto& right) { return left.first > right.first; });
+    positions.erase(std::unique(positions.begin(), positions.end(),
+                                [](const auto& left, const auto& right) { return left.first == right.first; }),
+                    positions.end());
+
+    const int helpPosition = findHelpMenuPosition(g_mainMenu);
+    const int menuCount = GetMenuItemCount(g_mainMenu);
+    for (const auto& entry : positions) {
+        const int position = entry.first;
+        if (position == helpPosition || position < 0 || position >= menuCount) {
+            debugLog(L"Cannot hide main menuId '" + entry.second + L"' at position=" + std::to_wstring(position));
+            continue;
+        }
+        MENUITEMINFOW item{};
+        item.cbSize = sizeof(item);
+        item.fMask = MIIM_SUBMENU;
+        if (!GetMenuItemInfoW(g_mainMenu, static_cast<UINT>(position), TRUE, &item) || !item.hSubMenu) {
+            debugLog(L"Main menuId has no submenu at expected position: '" + entry.second + L"'");
+            continue;
+        }
+        if (RemoveMenu(g_mainMenu, static_cast<UINT>(position), MF_BYPOSITION)) {
+            debugLog(L"Hidden main menuId='" + entry.second + L"' position=" + std::to_wstring(position));
+        } else {
+            debugLog(L"Failed to hide main menuId='" + entry.second + L"' error=" + std::to_wstring(GetLastError()));
+        }
+    }
+    if (!positions.empty()) DrawMenuBar(g_nppData._nppHandle);
+    g_hiddenMainMenusApplied = true;
+}
 static void removeMenus()
 {
     unregisterHotkeys();
@@ -4776,14 +4922,28 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
     cJSON* menuItem = cJSON_GetObjectItemCaseSensitive(root, "menu");
     cJSON* iconFolderItem = cJSON_GetObjectItemCaseSensitive(root, "icon_folder");
     cJSON* toolbarItem = cJSON_GetObjectItemCaseSensitive(root, "toolbar");
+    cJSON* hideMainMenusItem = cJSON_GetObjectItemCaseSensitive(root, "hide_main_menus");
     if (!cJSON_IsString(scriptFolderItem) ||
         !validMenuDefinition(menuItem) || (debugItem && !cJSON_IsBool(debugItem)) ||
         (iconFolderItem && !cJSON_IsString(iconFolderItem)) ||
-        (toolbarItem && !cJSON_IsArray(toolbarItem))) {
+        (toolbarItem && !cJSON_IsArray(toolbarItem)) ||
+        (hideMainMenusItem && !cJSON_IsArray(hideMainMenusItem))) {
         cJSON_Delete(root);
         MessageBoxW(g_nppData._nppHandle, tr("InvalidMenuJson").c_str(), L"NppMenuScripts", MB_OK | MB_ICONERROR);
         return false;
     }
+    std::vector<std::wstring> configuredHiddenMainMenuIds;
+    if (hideMainMenusItem) {
+        for (cJSON* item = hideMainMenusItem->child; item; item = item->next) {
+            if (!cJSON_IsString(item)) {
+                cJSON_Delete(root);
+                MessageBoxW(g_nppData._nppHandle, tr("InvalidMenuJson").c_str(), L"NppMenuScripts", MB_OK | MB_ICONERROR);
+                return false;
+            }
+            configuredHiddenMainMenuIds.push_back(utf8ToWide(item->valuestring));
+        }
+    }
+    g_hiddenMainMenuIds = std::move(configuredHiddenMainMenuIds);
     // Validate the new configuration completely before removing the current menu.
     // This keeps the existing menu available when Rebuild Menu & Toolbar encounters invalid JSON.
     int itemCount = 0;
@@ -4871,14 +5031,16 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
         return false;
     }
     if (g_toolbarIconsRegistered) {
-        if (configuredToolbarScripts != g_toolbarScriptFiles ||
+        g_toolbarRestartRequired = configuredToolbarScripts != g_toolbarScriptFiles ||
             configuredToolbarActions != g_toolbarActions ||
             configuredToolbarActionTargets != g_toolbarActionTargets ||
             configuredToolbarExecuteOptions != g_toolbarExecuteOptions ||
-            configuredToolbarIcons != g_toolbarIconFiles) {
+            configuredToolbarIcons != g_toolbarIconFiles ||
+            configuredToolbarTitles != g_toolbarTitles;
+        if (g_toolbarRestartRequired)
             debugLog(L"Toolbar configuration changed; restart Notepad++ for toolbar changes to take effect");
-        }
     } else {
+        g_toolbarRestartRequired = false;
         g_toolbarScriptFiles = configuredToolbarScripts;
         g_toolbarActions = configuredToolbarActions;
         g_toolbarActionTargets = configuredToolbarActionTargets;
@@ -4916,6 +5078,7 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
     debugLog(L"menu.json=" + jsonPath);
     debugLog(L"script_folder=" + g_scriptFolder);
     debugLog(L"output_pane_title=" + g_outputTitle);
+    hideConfiguredMainMenus();
     int helpMenuPosition = findHelpMenuPosition(g_mainMenu);
     for (cJSON* top = menuItem->child; top; top = top->next) {
         if (!top->string || !cJSON_IsArray(top)) continue;
@@ -5003,6 +5166,7 @@ extern "C" __declspec(dllexport) FuncItem* getFuncsArray(int* nbF)
 extern "C" __declspec(dllexport) void beNotified(SCNotification* notifyCode)
 {
     if (notifyCode && notifyCode->nmhdr.code == NPPN_READY) {
+        g_nppReady = true;
         loadTranslations();
         // setInfo() can run before Notepad++ has finished restoring its UI and
         // session. Reinstall the configured menus once the main window is ready
@@ -5019,6 +5183,7 @@ extern "C" __declspec(dllexport) void beNotified(SCNotification* notifyCode)
         if (g_outputDefaultTitle.empty()) g_outputDefaultTitle = L"Output Pane";
         setOutputPaneTitle(g_outputDefaultTitle);
         installPluginMenuMessageHook();
+        installHotkeyMessageHook();
         applyTranslatedPluginMenu();
         return;
     }
@@ -5057,6 +5222,7 @@ extern "C" __declspec(dllexport) void beNotified(SCNotification* notifyCode)
     }
     if (notifyCode && notifyCode->nmhdr.code == NPPN_SHUTDOWN) {
         removePluginMenuMessageHook();
+        removeHotkeyMessageHook();
         g_shuttingDown.store(true);
         g_stopRequested.store(true);
         {

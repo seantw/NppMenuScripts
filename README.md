@@ -133,6 +133,7 @@ If you change `script_folder`, copy `menu-helper.js` and `package.json` to its p
 - After editing and saving `menu.json`, choose **Rebuild Menu & Toolbar** from the plugin menu to apply the changes. Notepad++ does not need to be restarted.
 - Hold Ctrl and click a custom menu item or toolbar button to open its script for editing. If the file does not exist, you can choose to create a template.
 - Choose **Stop Script** from the plugin menu to forcefully terminate a running script and its managed child processes.
+- NppMenuScripts is flexible. If you prefer not to see the **Tools**, **Macro**, and **Run** main menus when Notepad++ starts, add their [`menuId`](https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/english.xml) to `hide_main_menus` in `menu.json`, for example: `"hide_main_menus": ["tools", "macro", "run"]`. You can also use NppMenuScripts to create your own features.
 
 ### Keyboard shortcuts
 

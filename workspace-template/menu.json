@@ -1,6 +1,7 @@
 {
   "script_folder": "./script",
   "icon_folder": "./icon",
+  "hide_main_menus": [],
   "menu": {
     "Sample(&1)": [
       { "title": "Hello World\tCtrl+F1", "script": "hello-world.js" },
