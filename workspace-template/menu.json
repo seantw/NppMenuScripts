@@ -65,21 +65,17 @@
       { "title": "Run Current Script", "action": "RUN_CURRENT_FILE" }
     ]
   },
-  "toolbar": [
-    {
-      "icon": "hello.ico",
-      "script": "hello-world.js",
-      "title": "Run Hello World"
-    },
-    {
-      "icon": "run.ico",
-      "action": "RUN_CURRENT_FILE",
-      "title": "Run Current Script"
-    },
-    {
-      "icon": "stop.ico",
-      "action": "STOP_SCRIPT",
-      "title": "Stop Script"
-    }
-  ]
+	"toolbar":	[{
+			"icon": "config.ico",
+      "title": "MenuScript Configuration",
+			"action": "CONFIGURE_MENU"
+		}, {
+			"icon": "run.ico",
+			"action": "RUN_CURRENT_FILE",
+			"title": "Run Current Script"
+		}, {
+			"icon": "stop.ico",
+			"action": "STOP_SCRIPT",
+			"title": "Stop Script"
+		}]
 }

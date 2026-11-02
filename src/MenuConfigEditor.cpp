@@ -1,0 +1,2566 @@
+#include "MenuConfigEditor.h"
+
+#include <windows.h>
+#include <windowsx.h>
+#include <commctrl.h>
+#include <commdlg.h>
+#include <shlobj.h>
+#include <shellapi.h>
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+#include "MenuConfigEditorResource.h"
+#include "Notepad_plus_msgs.h"
+
+extern "C" {
+#include "../third_party/cJSON.h"
+}
+
+namespace {
+
+static constexpr INT_PTR CONFIG_EDITOR_WORKSPACE_CHANGED_RESULT = 0x4D4B;
+static constexpr UINT TITLE_REFRESH_MESSAGE = WM_APP + 0x4D4;
+static constexpr UINT_PTR TITLE_REFRESH_TIMER = 0x4D55;
+enum class NodeKind { MenuRoot, ToolbarRoot, TopMenu, Submenu, Script, Action, Execute, Separator };
+
+enum class DropPosition { None, Before, Into, After };
+static constexpr UINT_PTR TREE_DRAG_EXPAND_TIMER = 0x4D53;
+
+struct EditorNode {
+    NodeKind kind{};
+    cJSON* value = nullptr;
+    cJSON* parent = nullptr;
+    bool topMenu = false;
+    unsigned int depth = 0;
+    std::wstring environmentText;
+    bool environmentTextLoaded = false;
+};
+
+struct EditorState {
+    MenuConfigEditorContext context;
+    HWND hwnd = nullptr;
+    HWND tree = nullptr;
+    HIMAGELIST treeImages = nullptr;
+    HWND tab = nullptr;
+    HWND emptyForm = nullptr;
+    HWND scriptForm = nullptr;
+    HWND actionForm = nullptr;
+    HWND executeForm = nullptr;
+    HWND submenuForm = nullptr;
+    HWND separatorForm = nullptr;
+    HWND settingsForm = nullptr;
+    HWND activeItemForm = nullptr;
+    HWND controlParent = nullptr;
+    HWND header = nullptr;
+    HWND titleLabel = nullptr;
+    HWND title = nullptr;
+    HWND shortcutLabel = nullptr;
+    HWND shortcut = nullptr;
+    HWND icon = nullptr;
+    HWND scriptLabel = nullptr;
+    HWND script = nullptr;
+    HWND scriptBrowse = nullptr;
+    HWND scriptEdit = nullptr;
+    HWND actionLabel = nullptr;
+    HWND action = nullptr;
+    HWND actionTargetLabel = nullptr;
+    HWND actionTarget = nullptr;
+    HWND actionHint = nullptr;
+    HWND actionHelp = nullptr;
+    HWND commandLabel = nullptr;
+    HWND command = nullptr;
+    HWND commandHelp = nullptr;
+    HWND saveBeforeRun = nullptr;
+    HWND runInLabel = nullptr;
+    HWND runIn = nullptr;
+    HWND codePageLabel = nullptr;
+    HWND codePage = nullptr;
+    HWND envLabel = nullptr;
+    HWND envList = nullptr;
+    HWND envHelp = nullptr;
+    HWND envName = nullptr;
+    HWND envValue = nullptr;
+    HWND envAdd = nullptr;
+    HWND envRemove = nullptr;
+    HWND info = nullptr;
+    HWND newButton = nullptr;
+    HWND deleteButton = nullptr;
+    HWND upButton = nullptr;
+    HWND downButton = nullptr;
+    HWND workspacePath = nullptr;
+    HWND menuJsonPath = nullptr;
+    HWND scriptFolderPath = nullptr;
+    HWND iconFolderPath = nullptr;
+    HWND workspaceSet = nullptr;
+    HWND workspaceOpen = nullptr;
+    HWND menuJsonBrowse = nullptr;
+    HWND menuJsonOpen = nullptr;
+    HWND pathsInfoGroup = nullptr;
+    HWND pathsInfoText = nullptr;
+    HWND scriptFolderSet = nullptr;
+    HWND scriptFolderOpen = nullptr;
+    HWND iconFolderSet = nullptr;
+    HWND iconFolderOpen = nullptr;
+    HWND saveButton = nullptr;
+    HFONT font = nullptr;
+    HFONT shortcutPlaceholderFont = nullptr;
+    HFONT shortcutClearFont = nullptr;
+    HICON customIcon = nullptr;
+    HICON iconPreview = nullptr;
+    cJSON* root = nullptr;
+    cJSON* menu = nullptr;
+    cJSON* toolbar = nullptr;
+    EditorNode* selected = nullptr;
+    std::vector<std::unique_ptr<EditorNode>> nodes;
+    std::map<std::wstring, std::wstring> environment;
+    std::wstring currentIconPath;
+    std::wstring shortcutHintText;
+    std::wstring workspaceFolder;
+    std::wstring iconFolder;
+    std::wstring scriptFolder;
+    bool toolbarItem = false;
+    bool dirty = false;
+    bool updating = false;
+    bool rebuildingTree = false;
+    bool shortcutClearPressed = false;
+    int activePage = 0;
+    bool draggingTreeItem = false;
+    HTREEITEM dragItem = nullptr;
+    HTREEITEM dragTarget = nullptr;
+    HTREEITEM pendingExpand = nullptr;
+    DropPosition dropPosition = DropPosition::None;
+};
+
+static std::wstring tr(EditorState& s, const char* key)
+{
+    if (s.context.translate) {
+        std::wstring value = s.context.translate(key);
+        if (!value.empty()) return value;
+    }
+    return std::wstring(key, key + std::strlen(key));
+}
+
+static std::wstring readText(HWND hwnd)
+{
+    const int length = GetWindowTextLengthW(hwnd);
+    std::wstring value(static_cast<size_t>(std::max(0, length)) + 1, L'\0');
+    if (length) GetWindowTextW(hwnd, value.data(), length + 1);
+    value.resize(static_cast<size_t>(std::max(0, length)));
+    return value;
+}
+
+static std::string toUtf8(const std::wstring& value)
+{
+    if (value.empty()) return {};
+    const int length = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (length <= 0) return {};
+    std::string result(static_cast<size_t>(length), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), length, nullptr, nullptr);
+    return result;
+}
+
+static std::wstring fromUtf8(const char* value)
+{
+    if (!value || !*value) return {};
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, nullptr, 0);
+    if (!length) length = MultiByteToWideChar(CP_UTF8, 0, value, -1, nullptr, 0);
+    if (!length) return {};
+    std::wstring result(static_cast<size_t>(length), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value, -1, result.data(), length);
+    result.resize(wcslen(result.c_str()));
+    return result;
+}
+
+static bool isAbsolute(const std::wstring& path)
+{
+    return (path.size() >= 3 && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) ||
+        (path.size() >= 2 && (path[0] == L'\\' || path[0] == L'/') && path[1] == path[0]);
+}
+
+static std::wstring fullPath(const std::wstring& path)
+{
+    if (path.empty()) return {};
+    wchar_t buffer[32768]{};
+    const DWORD length = GetFullPathNameW(path.c_str(), static_cast<DWORD>(std::size(buffer)), buffer, nullptr);
+    std::wstring result = length && length < std::size(buffer) ? std::wstring(buffer, length) : path;
+    std::replace(result.begin(), result.end(), L'/', L'\\');
+    // Keep a drive root's trailing slash, but remove it from ordinary directories
+    // so path-prefix comparisons work whether a picker returned a trailing slash.
+    while (result.size() > 3 && result.back() == L'\\') result.pop_back();
+    return result;
+}
+
+static std::wstring joinPath(const std::wstring& base, const std::wstring& path)
+{
+    if (isAbsolute(path)) return fullPath(path);
+    if (base.empty()) return path;
+    return fullPath(base + (base.back() == L'\\' || base.back() == L'/' ? L"" : L"\\") + path);
+}
+
+static bool pathWithin(const std::wstring& directory, const std::wstring& path)
+{
+    if (directory.empty() || path.size() <= directory.size()) return false;
+    if (CompareStringOrdinal(directory.c_str(), static_cast<int>(directory.size()), path.c_str(),
+                             static_cast<int>(directory.size()), TRUE) != CSTR_EQUAL) return false;
+    return directory.back() == L'\\' || path[directory.size()] == L'\\';
+}
+
+static std::wstring storedPath(const std::wstring& base, const std::wstring& path)
+{
+    const std::wstring absolute = fullPath(path);
+    const std::wstring baseFull = fullPath(base);
+    if (!baseFull.empty() && CompareStringOrdinal(baseFull.c_str(), static_cast<int>(baseFull.size()),
+                                                   absolute.c_str(), static_cast<int>(absolute.size()), TRUE) == CSTR_EQUAL)
+        return L".";
+    if (pathWithin(baseFull, absolute)) {
+        const size_t relativeStart = baseFull.back() == L'\\' ? baseFull.size() : baseFull.size() + 1;
+        std::wstring relative = absolute.substr(relativeStart);
+        std::replace(relative.begin(), relative.end(), L'\\', L'/');
+        return L"./" + relative;
+    }
+    return absolute;
+}
+
+static std::wstring storedScriptPath(const std::wstring& scriptFolder, const std::wstring& path)
+{
+    if (path.empty()) return {};
+    const std::wstring absolute = isAbsolute(path) ? fullPath(path) : fullPath(joinPath(scriptFolder, path));
+    const std::wstring baseFull = fullPath(scriptFolder);
+    if (pathWithin(baseFull, absolute)) {
+        const size_t relativeStart = baseFull.back() == L'\\' ? baseFull.size() : baseFull.size() + 1;
+        std::wstring relative = absolute.substr(relativeStart);
+        std::replace(relative.begin(), relative.end(), L'\\', L'/');
+        return relative;
+    }
+    return absolute;
+}
+
+static std::wstring displayedFolderPath(const std::wstring& base, const std::wstring& path)
+{
+    const std::wstring absolute = fullPath(path);
+    const std::wstring baseFull = fullPath(base);
+    if (CompareStringOrdinal(baseFull.c_str(), static_cast<int>(baseFull.size()),
+                             absolute.c_str(), static_cast<int>(absolute.size()), TRUE) == CSTR_EQUAL)
+        return L".";
+    if (pathWithin(baseFull, absolute)) {
+        const size_t relativeStart = baseFull.back() == L'\\' ? baseFull.size() : baseFull.size() + 1;
+        std::wstring relative = absolute.substr(relativeStart);
+        return L".\\" + relative;
+    }
+    return absolute;
+}
+
+static std::wstring resolvedPath(const std::wstring& base, const std::wstring& path)
+{
+    return isAbsolute(path) ? fullPath(path) : joinPath(base, path);
+}
+
+static bool fileExists(const std::wstring& path)
+{
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static cJSON* member(cJSON* object, const char* key)
+{
+    return cJSON_GetObjectItemCaseSensitive(object, key);
+}
+
+static bool setString(cJSON* object, const char* key, const std::wstring& value)
+{
+    const std::string utf8 = toUtf8(value);
+    cJSON* old = member(object, key);
+    if (old && cJSON_IsString(old)) return cJSON_SetValuestring(old, utf8.c_str()) != nullptr;
+    cJSON* replacement = cJSON_CreateString(utf8.c_str());
+    if (!replacement) return false;
+    if (old) return cJSON_ReplaceItemViaPointer(object, old, replacement) != 0;
+    return cJSON_AddItemToObject(object, key, replacement) != 0;
+}
+
+static bool setBool(cJSON* object, const char* key, bool value)
+{
+    cJSON* old = member(object, key);
+    if (old && cJSON_IsBool(old)) {
+        cJSON_SetBoolValue(old, value);
+        return true;
+    }
+    cJSON* replacement = cJSON_CreateBool(value);
+    if (!replacement) return false;
+    if (old) {
+        replacement->string = static_cast<char*>(std::malloc(std::strlen(key) + 1));
+        if (!replacement->string) { cJSON_Delete(replacement); return false; }
+        std::strcpy(replacement->string, key);
+        return cJSON_ReplaceItemViaPointer(object, old, replacement) != 0;
+    }
+    return cJSON_AddItemToObject(object, key, replacement) != 0;
+}
+
+static void setPropertyName(cJSON* item, const std::wstring& name)
+{
+    const std::string utf8 = toUtf8(name);
+    char* replacement = static_cast<char*>(std::malloc(utf8.size() + 1));
+    if (!replacement) return;
+    std::memcpy(replacement, utf8.c_str(), utf8.size() + 1);
+    std::free(item->string);
+    item->string = replacement;
+}
+
+static HWND control(EditorState& s, const wchar_t* type, const std::wstring& label, DWORD style,
+                   int x, int y, int width, int height, int id, DWORD exStyle = 0)
+{
+    (void)type; (void)style; (void)x; (void)y; (void)width; (void)height; (void)exStyle;
+    HWND hwnd = GetDlgItem(s.controlParent ? s.controlParent : s.hwnd, id);
+    if (hwnd && !label.empty()) SetWindowTextW(hwnd, label.c_str());
+    if (hwnd && s.font) SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(s.font), TRUE);
+    return hwnd;
+}
+
+static void show(HWND hwnd, bool visible)
+{
+    if (hwnd) ShowWindow(hwnd, visible ? SW_SHOW : SW_HIDE);
+}
+
+static void showChildDialogAndRepaint(HWND parent, HWND child)
+{
+    if (!parent || !child) return;
+    RECT bounds{};
+    const bool hasBounds = GetWindowRect(child, &bounds) != FALSE;
+    if (hasBounds) MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&bounds), 2);
+    ShowWindow(child, SW_SHOW);
+    if (hasBounds) InvalidateRect(parent, &bounds, TRUE);
+    InvalidateRect(child, nullptr, TRUE);
+    UpdateWindow(child);
+    if (hasBounds) UpdateWindow(parent);
+}
+
+static void offsetControlY(HWND hwnd, int pixels)
+{
+    if (!hwnd) return;
+    RECT rect{};
+    if (!GetWindowRect(hwnd, &rect)) return;
+    POINT origin{rect.left, rect.top};
+    HWND parent = GetParent(hwnd);
+    if (!parent || !MapWindowPoints(nullptr, parent, &origin, 1)) {
+        if (!parent) return;
+    }
+    SetWindowPos(hwnd, nullptr, origin.x, origin.y + pixels, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static EditorNode* makeNode(EditorState& s, NodeKind kind, cJSON* value, cJSON* parent,
+                            bool topMenu, unsigned int depth)
+{
+    auto node = std::make_unique<EditorNode>();
+    node->kind = kind;
+    node->value = value;
+    node->parent = parent;
+    node->topMenu = topMenu;
+    node->depth = depth;
+    EditorNode* raw = node.get();
+    s.nodes.push_back(std::move(node));
+    return raw;
+}
+
+static HTREEITEM insertTreeNode(EditorState& s, HTREEITEM parent, const std::wstring& label, EditorNode* node)
+{
+    TVINSERTSTRUCTW insert{};
+    insert.hParent = parent;
+    insert.hInsertAfter = TVI_LAST;
+    insert.item.mask = TVIF_TEXT | TVIF_PARAM;
+    insert.item.pszText = const_cast<wchar_t*>(label.c_str());
+    insert.item.lParam = reinterpret_cast<LPARAM>(node);
+    if (node) {
+        int image = -1;
+        switch (node->kind) {
+        case NodeKind::TopMenu:
+        case NodeKind::Submenu: image = 0; break;
+        case NodeKind::Script: image = 1; break;
+        case NodeKind::Action: image = 2; break;
+        case NodeKind::Execute: image = 3; break;
+        default: break;
+        }
+        if (image >= 0 && s.treeImages) {
+            insert.item.mask |= TVIF_IMAGE | TVIF_SELECTEDIMAGE;
+            insert.item.iImage = image;
+            insert.item.iSelectedImage = image;
+        }
+    }
+    return reinterpret_cast<HTREEITEM>(SendMessageW(s.tree, TVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&insert)));
+}
+
+static void initializeTreeImages(EditorState& s)
+{
+    const int size = std::max(16, GetSystemMetrics(SM_CXSMICON));
+    HIMAGELIST images = ImageList_Create(size, size, ILC_COLOR32 | ILC_MASK, 4, 0);
+    if (!images) return;
+    const int resources[] = {
+        IDR_TREE_FOLDER_ICON, IDR_TREE_SCRIPT_ICON,
+        IDR_TREE_ACTION_ICON, IDR_TREE_COMMAND_ICON
+    };
+    bool complete = true;
+    for (int resource : resources) {
+        HICON icon = static_cast<HICON>(LoadImageW(s.context.module, MAKEINTRESOURCEW(resource),
+                                                   IMAGE_ICON, size, size, LR_DEFAULTCOLOR));
+        if (!icon) {
+            complete = false;
+            break;
+        }
+        if (ImageList_AddIcon(images, icon) < 0) complete = false;
+        DestroyIcon(icon);
+        if (!complete) break;
+    }
+    if (!complete || ImageList_GetImageCount(images) != static_cast<int>(std::size(resources))) {
+        ImageList_Destroy(images);
+        return;
+    }
+    s.treeImages = images;
+    TreeView_SetImageList(s.tree, s.treeImages, TVSIL_NORMAL);
+}
+
+static void loadSelected(EditorState& s, EditorNode* node);
+static bool commitSelected(EditorState& s);
+
+static std::wstring itemTitle(EditorNode* node)
+{
+    if (!node || !node->value) return {};
+    if (node->kind == NodeKind::Separator) return L"────────";
+    std::wstring title;
+    if (node->topMenu) title = fromUtf8(node->value->string);
+    else {
+        cJSON* value = member(node->value, "title");
+        if (cJSON_IsString(value)) title = fromUtf8(value->valuestring);
+    }
+    const size_t shortcut = title.find(L'\t');
+    if (shortcut != std::wstring::npos) title.resize(shortcut);
+    return title;
+}
+
+static std::pair<std::wstring, std::wstring> splitShortcut(const std::wstring& title)
+{
+    const size_t tab = title.find(L'\t');
+    return tab == std::wstring::npos ? std::make_pair(title, std::wstring()) :
+        std::make_pair(title.substr(0, tab), title.substr(tab + 1));
+}
+
+static void refreshSelectedTreeItemTitle(EditorState& s)
+{
+    EditorNode* node = s.selected;
+    if (!node || node->kind == NodeKind::MenuRoot || node->kind == NodeKind::ToolbarRoot ||
+        node->kind == NodeKind::Separator)
+        return;
+    const HTREEITEM itemHandle = TreeView_GetSelection(s.tree);
+    if (!itemHandle) return;
+
+    TVITEMW current{};
+    current.mask = TVIF_PARAM;
+    current.hItem = itemHandle;
+    if (!SendMessageW(s.tree, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&current)) ||
+        reinterpret_cast<EditorNode*>(current.lParam) != node)
+        return;
+
+    const std::wstring label = itemTitle(node);
+    std::vector<wchar_t> text(label.begin(), label.end());
+    text.push_back(L'\0');
+    TVITEMW update{};
+    update.mask = TVIF_TEXT;
+    update.hItem = itemHandle;
+    update.pszText = text.data();
+    update.cchTextMax = static_cast<int>(text.size());
+    SendMessageW(s.tree, TVM_SETITEMW, 0, reinterpret_cast<LPARAM>(&update));
+}
+
+static void addTreeArray(EditorState& s, HTREEITEM parentItem, cJSON* array, unsigned int depth)
+{
+    for (cJSON* item = array ? array->child : nullptr; item; item = item->next) {
+        EditorNode* node = nullptr;
+        cJSON* sub = member(item, "sub");
+        if (item->string && cJSON_IsArray(item)) {
+            node = makeNode(s, NodeKind::TopMenu, item, s.menu, true, depth);
+        } else if (cJSON_IsObject(item) && sub && cJSON_IsArray(sub)) {
+            node = makeNode(s, NodeKind::Submenu, item, array, false, depth);
+        } else if (cJSON_IsObject(item) && !item->child) {
+            node = makeNode(s, NodeKind::Separator, item, array, false, depth);
+        } else if (member(item, "script")) {
+            node = makeNode(s, NodeKind::Script, item, array, false, depth);
+        } else if (member(item, "action")) {
+            node = makeNode(s, NodeKind::Action, item, array, false, depth);
+        } else if (member(item, "execute")) {
+            node = makeNode(s, NodeKind::Execute, item, array, false, depth);
+        } else {
+            continue;
+        }
+        HTREEITEM child = insertTreeNode(s, parentItem, itemTitle(node), node);
+        if (node->kind == NodeKind::TopMenu) addTreeArray(s, child, node->value, depth + 1);
+        else if (node->kind == NodeKind::Submenu) addTreeArray(s, child, member(node->value, "sub"), depth + 1);
+    }
+}
+
+static void captureTreeExpansion(EditorState& s, HTREEITEM item, std::map<cJSON*, bool>& expansion)
+{
+    for (HTREEITEM current = item; current; current = TreeView_GetNextSibling(s.tree, current)) {
+        TVITEMW data{};
+        data.mask = TVIF_PARAM | TVIF_STATE;
+        data.stateMask = TVIS_EXPANDED;
+        data.hItem = current;
+        if (TreeView_GetItem(s.tree, &data)) {
+            auto* node = reinterpret_cast<EditorNode*>(data.lParam);
+            if (node && node->value)
+                expansion[node->value] = (data.state & TVIS_EXPANDED) != 0;
+        }
+        captureTreeExpansion(s, TreeView_GetChild(s.tree, current), expansion);
+    }
+}
+
+static void restoreTreeExpansion(EditorState& s, HTREEITEM item,
+                                 const std::map<cJSON*, bool>& expansion, bool initialBuild)
+{
+    for (HTREEITEM current = item; current; current = TreeView_GetNextSibling(s.tree, current)) {
+        TVITEMW data{};
+        data.mask = TVIF_PARAM;
+        data.hItem = current;
+        EditorNode* node = TreeView_GetItem(s.tree, &data)
+            ? reinterpret_cast<EditorNode*>(data.lParam) : nullptr;
+        bool expanded = false;
+        bool hasSavedState = false;
+        if (node && node->value) {
+            const auto saved = expansion.find(node->value);
+            if (saved != expansion.end()) {
+                expanded = saved->second;
+                hasSavedState = true;
+            }
+        }
+        if (hasSavedState)
+            TreeView_Expand(s.tree, current, expanded ? TVE_EXPAND : TVE_COLLAPSE);
+        else if (initialBuild && node &&
+                 (node->kind == NodeKind::MenuRoot || node->kind == NodeKind::ToolbarRoot))
+            TreeView_Expand(s.tree, current, TVE_EXPAND);
+        restoreTreeExpansion(s, TreeView_GetChild(s.tree, current), expansion, initialBuild);
+    }
+}
+
+static void rebuildTree(EditorState& s, cJSON* selectedValue = nullptr)
+{
+    // Deleting and repopulating tree items synchronously emits selection notifications.
+    // Ignore those notifications while node pointers are being replaced.
+    std::map<cJSON*, bool> expansion;
+    const bool initialBuild = TreeView_GetCount(s.tree) == 0;
+    if (!initialBuild)
+        captureTreeExpansion(s, TreeView_GetChild(s.tree, TVI_ROOT), expansion);
+    s.rebuildingTree = true;
+    s.selected = nullptr;
+    SendMessageW(s.tree, WM_SETREDRAW, FALSE, 0);
+    TreeView_DeleteAllItems(s.tree);
+    s.nodes.clear();
+    EditorNode* menuRoot = makeNode(s, NodeKind::MenuRoot, s.menu, s.root, false, 0);
+    EditorNode* toolbarRoot = makeNode(s, NodeKind::ToolbarRoot, s.toolbar, s.root, false, 0);
+    HTREEITEM menuItem = insertTreeNode(s, TVI_ROOT, tr(s, "ConfigMenuRoot"), menuRoot);
+    addTreeArray(s, menuItem, s.menu, 1);
+    HTREEITEM toolbarItem = insertTreeNode(s, TVI_ROOT, tr(s, "ConfigToolbarRoot"), toolbarRoot);
+    addTreeArray(s, toolbarItem, s.toolbar, 1);
+    restoreTreeExpansion(s, TreeView_GetChild(s.tree, TVI_ROOT), expansion, initialBuild);
+    HTREEITEM selectedItem = nullptr;
+    const int count = TreeView_GetCount(s.tree);
+    (void)count;
+    std::function<void(HTREEITEM)> find = [&](HTREEITEM item) {
+        for (HTREEITEM current = item; current && !selectedItem; current = TreeView_GetNextSibling(s.tree, current)) {
+            TVITEMW data{}; data.mask = TVIF_PARAM; data.hItem = current;
+            TreeView_GetItem(s.tree, &data);
+            auto* node = reinterpret_cast<EditorNode*>(data.lParam);
+            if (selectedValue && node && node->value == selectedValue) { selectedItem = current; break; }
+            find(TreeView_GetChild(s.tree, current));
+        }
+    };
+    find(TreeView_GetChild(s.tree, TVI_ROOT));
+    if (!selectedItem) selectedItem = menuItem;
+    TreeView_SelectItem(s.tree, selectedItem);
+    if (selectedValue)
+        TreeView_EnsureVisible(s.tree, selectedItem);
+    TVITEMW selectedData{};
+    selectedData.mask = TVIF_PARAM;
+    selectedData.hItem = selectedItem;
+    if (TreeView_GetItem(s.tree, &selectedData))
+        loadSelected(s, reinterpret_cast<EditorNode*>(selectedData.lParam));
+    s.rebuildingTree = false;
+    SendMessageW(s.tree, WM_SETREDRAW, TRUE, 0);
+    RedrawWindow(s.tree, nullptr, nullptr,
+                 RDW_ERASE | RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+}
+
+static EditorNode* treeNode(EditorState& s, HTREEITEM item)
+{
+    if (!item) return nullptr;
+    TVITEMW data{};
+    data.mask = TVIF_PARAM;
+    data.hItem = item;
+    return TreeView_GetItem(s.tree, &data)
+        ? reinterpret_cast<EditorNode*>(data.lParam) : nullptr;
+}
+
+static bool treeItemContains(EditorState& s, HTREEITEM parent, HTREEITEM item)
+{
+    for (HTREEITEM current = item; current; current = TreeView_GetParent(s.tree, current))
+        if (current == parent) return true;
+    return false;
+}
+
+static unsigned int deepestTreeDepth(EditorState& s, HTREEITEM item)
+{
+    EditorNode* node = treeNode(s, item);
+    unsigned int deepest = node ? node->depth : 0;
+    for (HTREEITEM child = TreeView_GetChild(s.tree, item); child;
+         child = TreeView_GetNextSibling(s.tree, child))
+        deepest = std::max(deepest, deepestTreeDepth(s, child));
+    return deepest;
+}
+
+static HCURSOR systemCursor(WORD resourceId)
+{
+    return LoadCursorW(nullptr, MAKEINTRESOURCEW(resourceId));
+}
+
+static bool dropDestination(EditorState& s, HTREEITEM sourceItem, HTREEITEM targetItem,
+                            DropPosition position, cJSON*& destination)
+{
+    destination = nullptr;
+    EditorNode* source = treeNode(s, sourceItem);
+    EditorNode* target = treeNode(s, targetItem);
+    if (!source || !target || !source->parent || sourceItem == targetItem ||
+        source->kind == NodeKind::MenuRoot || source->kind == NodeKind::ToolbarRoot ||
+        target->kind == NodeKind::MenuRoot || target->kind == NodeKind::ToolbarRoot)
+        return false;
+
+    const bool sourceToolbar = source->parent == s.toolbar;
+    const bool targetToolbar = target->parent == s.toolbar;
+    if (sourceToolbar != targetToolbar) return false;
+
+    if (position == DropPosition::Before || position == DropPosition::After) {
+        if (treeItemContains(s, sourceItem, targetItem)) return false;
+        if (source->topMenu) {
+            // Top-level menu entries live in an object, so keep them among their siblings.
+            if (source->parent != target->parent) return false;
+            destination = source->parent;
+            return true;
+        }
+        destination = target->parent;
+        if (!cJSON_IsArray(destination)) {
+            destination = nullptr;
+            return false;
+        }
+        const unsigned int sourceSubtreeDepth = deepestTreeDepth(s, sourceItem) - source->depth;
+        if (target->depth + sourceSubtreeDepth > 17) {
+            destination = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    if (position != DropPosition::Into || sourceToolbar || source->topMenu ||
+        treeItemContains(s, sourceItem, targetItem)) return false;
+
+    if (target->kind == NodeKind::TopMenu) destination = target->value;
+    else if (target->kind == NodeKind::Submenu) destination = member(target->value, "sub");
+    if (!cJSON_IsArray(destination)) {
+        destination = nullptr;
+        return false;
+    }
+
+    const unsigned int sourceSubtreeDepth = deepestTreeDepth(s, sourceItem) - source->depth;
+    if (target->depth + 1 + sourceSubtreeDepth > 17) {
+        destination = nullptr;
+        return false;
+    }
+    return true;
+}
+
+static void clearTreeDropFeedback(EditorState& s)
+{
+    if (s.hwnd) KillTimer(s.hwnd, TREE_DRAG_EXPAND_TIMER);
+    s.pendingExpand = nullptr;
+    s.dragTarget = nullptr;
+    s.dropPosition = DropPosition::None;
+    TreeView_SetInsertMark(s.tree, nullptr, FALSE);
+    TreeView_SelectDropTarget(s.tree, nullptr);
+}
+
+static bool updateTreeDrag(EditorState& s)
+{
+    POINT screen{};
+    if (!GetCursorPos(&screen)) return false;
+    POINT client = screen;
+    ScreenToClient(s.tree, &client);
+    RECT clientRect{};
+    GetClientRect(s.tree, &clientRect);
+    if (!PtInRect(&clientRect, client)) {
+        clearTreeDropFeedback(s);
+        SetCursor(systemCursor(32648)); // IDC_NO
+        return false;
+    }
+
+    TVHITTESTINFO hit{};
+    hit.pt = client;
+    HTREEITEM targetItem = TreeView_HitTest(s.tree, &hit);
+    RECT row{};
+    if (!targetItem || !TreeView_GetItemRect(s.tree, targetItem, &row, TRUE)) {
+        clearTreeDropFeedback(s);
+        SetCursor(systemCursor(32648)); // IDC_NO
+        return false;
+    }
+
+    EditorNode* target = treeNode(s, targetItem);
+    const int height = std::max(1, static_cast<int>(row.bottom - row.top));
+    const int relativeY = client.y - row.top;
+    DropPosition position = DropPosition::None;
+    EditorNode* source = treeNode(s, s.dragItem);
+    const bool container = source && !source->topMenu && target &&
+        (target->kind == NodeKind::TopMenu || target->kind == NodeKind::Submenu);
+    if (container && relativeY >= height / 4 && relativeY < (height * 3) / 4)
+        position = DropPosition::Into;
+    else
+        position = relativeY < height / 2 ? DropPosition::Before : DropPosition::After;
+
+    cJSON* destination = nullptr;
+    if (!dropDestination(s, s.dragItem, targetItem, position, destination)) {
+        clearTreeDropFeedback(s);
+        SetCursor(systemCursor(32648)); // IDC_NO
+        return false;
+    }
+
+    if (s.dragTarget != targetItem || s.dropPosition != position) {
+        clearTreeDropFeedback(s);
+        s.dragTarget = targetItem;
+        s.dropPosition = position;
+        if (position == DropPosition::Into) {
+            TreeView_SelectDropTarget(s.tree, targetItem);
+            TVITEMW state{};
+            state.mask = TVIF_STATE;
+            state.stateMask = TVIS_EXPANDED;
+            state.hItem = targetItem;
+            if (TreeView_GetItem(s.tree, &state) && !(state.state & TVIS_EXPANDED)) {
+                s.pendingExpand = targetItem;
+                SetTimer(s.hwnd, TREE_DRAG_EXPAND_TIMER, 650, nullptr);
+            }
+        } else {
+            TreeView_SetInsertMark(s.tree, targetItem, position == DropPosition::After);
+        }
+    }
+    SetCursor(systemCursor(32646)); // IDC_SIZEALL
+    return true;
+}
+
+static bool reorderLinked(cJSON* parent, cJSON* item, bool up);
+
+static int linkedIndex(cJSON* parent, cJSON* item)
+{
+    int index = 0;
+    for (cJSON* current = parent ? parent->child : nullptr; current; current = current->next, ++index)
+        if (current == item) return index;
+    return -1;
+}
+
+static bool performTreeDrop(EditorState& s, HTREEITEM sourceItem, HTREEITEM targetItem,
+                           DropPosition position)
+{
+    cJSON* destination = nullptr;
+    if (!dropDestination(s, sourceItem, targetItem, position, destination)) return false;
+    EditorNode* source = treeNode(s, sourceItem);
+    EditorNode* target = treeNode(s, targetItem);
+    if (!source || !target) return false;
+
+    cJSON* value = source->value;
+    if (position == DropPosition::Before || position == DropPosition::After) {
+        const bool after = position == DropPosition::After;
+        if (source->topMenu) {
+            int sourceIndex = linkedIndex(source->parent, value);
+            const int targetIndex = linkedIndex(source->parent, target->value);
+            if (sourceIndex < 0 || targetIndex < 0) return false;
+            const int desired = targetIndex + (after ? 1 : 0) - (sourceIndex < targetIndex + (after ? 1 : 0) ? 1 : 0);
+            while (sourceIndex > desired) {
+                if (!reorderLinked(source->parent, value, true)) return false;
+                --sourceIndex;
+            }
+            while (sourceIndex < desired) {
+                if (!reorderLinked(source->parent, value, false)) return false;
+                ++sourceIndex;
+            }
+        } else {
+            cJSON* oldParent = source->parent;
+            cJSON* destinationParent = target->parent;
+            int oldIndex = -1;
+            for (int i = 0; i < cJSON_GetArraySize(oldParent); ++i)
+                if (cJSON_GetArrayItem(oldParent, i) == value) { oldIndex = i; break; }
+            if (oldIndex < 0) return false;
+            cJSON* detached = cJSON_DetachItemViaPointer(oldParent, value);
+            if (!detached) return false;
+            const int targetIndex = linkedIndex(destinationParent, target->value);
+            const int insertIndex = targetIndex + (after ? 1 : 0);
+            if (targetIndex < 0 || !cJSON_InsertItemInArray(destinationParent, insertIndex, detached)) {
+                cJSON_InsertItemInArray(oldParent, oldIndex, detached);
+                return false;
+            }
+        }
+    } else {
+        cJSON* oldParent = source->parent;
+        int oldIndex = -1;
+        for (int i = 0; i < cJSON_GetArraySize(oldParent); ++i)
+            if (cJSON_GetArrayItem(oldParent, i) == value) { oldIndex = i; break; }
+        cJSON* detached = cJSON_DetachItemViaPointer(oldParent, value);
+        if (!detached) return false;
+        if (!cJSON_AddItemToArray(destination, detached)) {
+            if (oldIndex >= 0) cJSON_InsertItemInArray(oldParent, oldIndex, detached);
+            return false;
+        }
+    }
+
+    s.dirty = true;
+    rebuildTree(s, value);
+    return true;
+}
+
+static void endTreeDrag(EditorState& s, bool applyDrop)
+{
+    const HTREEITEM source = s.dragItem;
+    const HTREEITEM target = s.dragTarget;
+    const DropPosition position = s.dropPosition;
+    s.draggingTreeItem = false;
+    clearTreeDropFeedback(s);
+    s.dragItem = nullptr;
+    if (GetCapture() == s.hwnd) ReleaseCapture();
+    SetCursor(systemCursor(32512)); // IDC_ARROW
+    if (applyDrop && source && target && position != DropPosition::None)
+        performTreeDrop(s, source, target, position);
+}
+
+static void beginTreeDrag(EditorState& s, HTREEITEM item)
+{
+    EditorNode* node = treeNode(s, item);
+    if (!node || !node->parent || node->kind == NodeKind::MenuRoot || node->kind == NodeKind::ToolbarRoot)
+        return;
+    if (!commitSelected(s)) {
+        MessageBoxW(s.hwnd, tr(s, "ConfigDuplicateMenuTitle").c_str(), tr(s, "ConfigTitle").c_str(),
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+    s.dragItem = item;
+    s.dragTarget = nullptr;
+    s.dropPosition = DropPosition::None;
+    s.draggingTreeItem = true;
+    SetCapture(s.hwnd);
+    updateTreeDrag(s);
+}
+
+static void loadEnvironment(EditorState& s, cJSON* execute)
+{
+    s.environment.clear();
+    cJSON* env = member(execute, "env");
+    for (cJSON* item = env ? env->child : nullptr; item; item = item->next)
+        if (item->string && cJSON_IsString(item)) s.environment[fromUtf8(item->string)] = fromUtf8(item->valuestring);
+}
+
+static void loadEnvironmentText(EditorState& s, EditorNode* node)
+{
+    if (!node || node->kind != NodeKind::Execute) return;
+    if (!node->environmentTextLoaded) {
+        std::wstring text;
+        cJSON* execute = member(node->value, "execute");
+        cJSON* env = member(execute, "env");
+        for (cJSON* item = env ? env->child : nullptr; item; item = item->next) {
+            if (!item->string || !cJSON_IsString(item)) continue;
+            if (!text.empty()) text += L"\r\n";
+            text += fromUtf8(item->string) + L"=" + fromUtf8(item->valuestring);
+        }
+        node->environmentText = std::move(text);
+        node->environmentTextLoaded = true;
+    }
+    SetWindowTextW(s.envList, node->environmentText.c_str());
+    SendMessageW(s.envList, EM_SETSEL, 0, 0);
+    SendMessageW(s.envList, EM_SCROLLCARET, 0, 0);
+}
+
+static std::map<std::wstring, std::wstring> parseEnvironmentText(const std::wstring& text)
+{
+    std::map<std::wstring, std::wstring> values;
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t end = text.find_first_of(L"\r\n", start);
+        if (end == std::wstring::npos) end = text.size();
+        const std::wstring line = text.substr(start, end - start);
+        if (!line.empty() && line[0] != L'#') {
+            const size_t equals = line.find(L'=');
+            if (equals != std::wstring::npos && equals > 0) values[line.substr(0, equals)] = line.substr(equals + 1);
+        }
+        if (end == text.size()) break;
+        start = end + 1;
+        if (text[end] == L'\r' && start < text.size() && text[start] == L'\n') ++start;
+    }
+    return values;
+}
+
+static void refreshEnvironment(EditorState& s)
+{
+    SendMessageW(s.envList, LB_RESETCONTENT, 0, 0);
+    for (const auto& pair : s.environment) {
+        std::wstring row = pair.first + L" = " + pair.second;
+        SendMessageW(s.envList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row.c_str()));
+    }
+}
+
+static void fillRunIn(EditorState& s, const std::wstring& selected)
+{
+    SendMessageW(s.runIn, CB_RESETCONTENT, 0, 0);
+    const struct { const wchar_t* value; const char* label; } values[] = {
+        {L"output_pane", "OutputPane"}, {L"console", "ConfigConsole"}, {L"windows", "ConfigWindows"}
+    };
+    for (const auto& value : values) {
+        const std::wstring label = tr(s, value.label);
+        const int index = static_cast<int>(SendMessageW(s.runIn, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str())));
+        SendMessageW(s.runIn, CB_SETITEMDATA, index, reinterpret_cast<LPARAM>(value.value));
+        if (selected == value.value) SendMessageW(s.runIn, CB_SETCURSEL, index, 0);
+    }
+    if (SendMessageW(s.runIn, CB_GETCURSEL, 0, 0) == CB_ERR) SendMessageW(s.runIn, CB_SETCURSEL, 0, 0);
+}
+
+static std::wstring selectedRunIn(EditorState& s)
+{
+    const LRESULT index = SendMessageW(s.runIn, CB_GETCURSEL, 0, 0);
+    if (index == CB_ERR) return L"output_pane";
+    const wchar_t* value = reinterpret_cast<const wchar_t*>(SendMessageW(s.runIn, CB_GETITEMDATA, index, 0));
+    return value ? value : L"output_pane";
+}
+
+static void fillActionCombo(EditorState& s, const std::wstring& token)
+{
+    SendMessageW(s.action, CB_RESETCONTENT, 0, 0);
+    const struct { const char* key; int value; const wchar_t* token; } values[] = {
+        {"ConfigRunCurrentFile", 1, L"RUN_CURRENT_FILE"},
+        {"ConfigStopScript", 2, L"STOP_SCRIPT"},
+        {"ConfigRunMenuCommand", 3, L"MENU:"},
+        {"ConfigOpenMenuConfig", 4, L"CONFIGURE_MENU"}
+    };
+    int selected = 0;
+    for (size_t i = 0; i < std::size(values); ++i) {
+        const std::wstring label = tr(s, values[i].key);
+        const int index = static_cast<int>(SendMessageW(s.action, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str())));
+        SendMessageW(s.action, CB_SETITEMDATA, index, values[i].value);
+        if ((values[i].value == 1 && token == L"RUN_CURRENT_FILE") ||
+            (values[i].value == 2 && token == L"STOP_SCRIPT") ||
+            (values[i].value == 3 && token.rfind(L"MENU:", 0) == 0) ||
+            (values[i].value == 4 && token == L"CONFIGURE_MENU")) selected = index;
+    }
+    SendMessageW(s.action, CB_SETCURSEL, selected, 0);
+}
+
+static void updateIconPreview(EditorState& s)
+{
+    if (s.customIcon) { DestroyIcon(s.customIcon); s.customIcon = nullptr; }
+    HICON icon = nullptr;
+    if (!s.currentIconPath.empty()) {
+        const std::wstring path = resolvedPath(s.iconFolder, s.currentIconPath);
+        icon = static_cast<HICON>(LoadImageW(nullptr, path.c_str(), IMAGE_ICON, 32, 32, LR_LOADFROMFILE));
+        if (icon) s.customIcon = icon;
+    }
+    if (!icon) icon = static_cast<HICON>(LoadImageW(s.context.module, MAKEINTRESOURCEW(101), IMAGE_ICON, 32, 32, LR_SHARED));
+    s.iconPreview = icon;
+    InvalidateRect(s.icon, nullptr, TRUE);
+    if (!s.currentIconPath.empty() && !s.customIcon) SetWindowTextW(s.icon, tr(s, "ConfigChangeIcon").c_str());
+}
+
+static LRESULT CALLBACK shortcutSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+static LRESULT CALLBACK helpLinkSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+static void applySingleLineEditInsets(HWND);
+static void applyMultilineEditInsets(HWND);
+
+static HWND itemFormFor(EditorState& s, EditorNode* node)
+{
+    if (!node || node->kind == NodeKind::MenuRoot || node->kind == NodeKind::ToolbarRoot)
+        return s.emptyForm;
+    switch (node->kind) {
+    case NodeKind::TopMenu:
+    case NodeKind::Submenu: return s.submenuForm;
+    case NodeKind::Script: return s.scriptForm;
+    case NodeKind::Action: return s.actionForm;
+    case NodeKind::Execute: return s.executeForm;
+    case NodeKind::Separator: return s.separatorForm;
+    default: return s.emptyForm;
+    }
+}
+
+static void bindItemForm(EditorState& s, EditorNode* node)
+{
+    HWND form = itemFormFor(s, node);
+    if (s.activeItemForm) ShowWindow(s.activeItemForm, SW_HIDE);
+    for (HWND other : {s.emptyForm, s.scriptForm, s.actionForm, s.executeForm,
+                       s.submenuForm, s.separatorForm})
+        if (other && other != form) ShowWindow(other, SW_HIDE);
+    s.activeItemForm = form;
+    auto get = [form](int id) { return form ? GetDlgItem(form, id) : nullptr; };
+    s.header = GetDlgItem(s.hwnd, ID_HEADER);
+    s.titleLabel = get(ID_TITLE_LABEL); s.title = get(ID_TITLE);
+    s.shortcutLabel = get(ID_SHORTCUT_LABEL); s.shortcut = get(ID_SHORTCUT);
+    s.icon = get(ID_ICON);
+    s.scriptLabel = get(ID_SCRIPT_LABEL); s.script = get(ID_SCRIPT);
+    s.scriptBrowse = get(ID_SCRIPT_BROWSE); s.scriptEdit = get(ID_SCRIPT_EDIT);
+    s.actionLabel = get(ID_ACTION_LABEL); s.action = get(ID_ACTION);
+    s.actionTargetLabel = get(ID_ACTION_TARGET_LABEL); s.actionTarget = get(ID_ACTION_TARGET);
+    s.actionHint = get(ID_ACTION_HINT); s.actionHelp = get(ID_ACTION_HELP);
+    s.commandLabel = get(ID_COMMAND_LABEL); s.command = get(ID_COMMAND);
+    s.commandHelp = get(ID_COMMAND_HELP); s.saveBeforeRun = get(ID_SAVE_BEFORE_RUN);
+    s.runInLabel = get(ID_RUN_IN_LABEL); s.runIn = get(ID_RUN_IN);
+    s.codePageLabel = get(ID_CODE_PAGE_LABEL); s.codePage = get(ID_CODE_PAGE);
+    s.envLabel = get(ID_ENV_LABEL); s.envList = get(ID_ENV_LIST); s.envHelp = get(ID_ENV_HELP);
+    s.info = get(ID_INFO);
+
+    if (s.shortcut) {
+        SetWindowSubclass(s.shortcut, shortcutSubclass, 1, reinterpret_cast<DWORD_PTR>(&s));
+        const DWORD margins = static_cast<DWORD>(SendMessageW(s.shortcut, EM_GETMARGINS, 0, 0));
+        SendMessageW(s.shortcut, EM_SETMARGINS, EC_RIGHTMARGIN, MAKELONG(LOWORD(margins), 30));
+    }
+    if (s.commandHelp) SetWindowSubclass(s.commandHelp, helpLinkSubclass, 1, reinterpret_cast<DWORD_PTR>(&s));
+    if (s.envHelp) SetWindowSubclass(s.envHelp, helpLinkSubclass, 1, reinterpret_cast<DWORD_PTR>(&s));
+
+    for (HWND edit : {s.title, s.shortcut, s.script, s.actionTarget}) applySingleLineEditInsets(edit);
+    for (HWND edit : {s.command, s.envList}) applyMultilineEditInsets(edit);
+    if (s.codePage) {
+        COMBOBOXINFO comboInfo{sizeof(comboInfo)};
+        if (GetComboBoxInfo(s.codePage, &comboInfo) && comboInfo.hwndItem)
+            applySingleLineEditInsets(comboInfo.hwndItem);
+    }
+    for (HWND combo : {s.action, s.runIn, s.codePage}) if (combo) {
+        SendMessageW(combo, CB_SETITEMHEIGHT, 1, 25);
+        SendMessageW(combo, CB_SETITEMHEIGHT, 0, 22);
+    }
+}
+
+static void showTypeControls(EditorState& s, NodeKind kind, bool hasItem)
+{
+    const bool submenu = kind == NodeKind::Submenu || kind == NodeKind::TopMenu;
+    const bool script = kind == NodeKind::Script;
+    const bool action = kind == NodeKind::Action;
+    const bool execute = kind == NodeKind::Execute;
+    const bool separator = kind == NodeKind::Separator;
+    show(s.icon, hasItem && s.toolbarItem && s.icon);
+    if (s.header) {
+        std::wstring heading;
+        if (script) heading = tr(s, "ConfigScriptSettings");
+        else if (action) heading = tr(s, "ConfigActionSettings");
+        else if (execute) heading = tr(s, "ConfigExecuteSettings");
+        else if (submenu) heading = tr(s, "ConfigSubmenuSettings");
+        else if (separator) heading = tr(s, "ConfigSeparator");
+        else heading = tr(s, "ConfigItemSettings");
+        SetWindowTextW(s.header, heading.c_str());
+    }
+
+}
+
+static void showActionTargetControls(EditorState& s, bool visible)
+{
+    show(s.actionTargetLabel, visible);
+    show(s.actionTarget, visible);
+    show(s.actionHint, visible);
+    show(s.actionHelp, visible);
+    EnableWindow(s.actionTarget, visible);
+}
+
+static void loadSelected(EditorState& s, EditorNode* node)
+{
+    s.updating = true;
+    s.selected = node;
+    s.toolbarItem = node && node->parent == s.toolbar && node->kind != NodeKind::ToolbarRoot;
+    bindItemForm(s, node);
+    const bool submenu = node && (node->kind == NodeKind::Submenu || node->kind == NodeKind::TopMenu);
+    const bool separator = node && node->kind == NodeKind::Separator;
+    const bool hasItem = node && node->kind != NodeKind::MenuRoot && node->kind != NodeKind::ToolbarRoot;
+    showTypeControls(s, node ? node->kind : NodeKind::MenuRoot, hasItem);
+    std::wstring title;
+    if (node && node->topMenu) title = fromUtf8(node->value->string);
+    else if (node && hasItem && node->kind != NodeKind::Separator) {
+        cJSON* titleItem = member(node->value, "title");
+        if (cJSON_IsString(titleItem)) title = fromUtf8(titleItem->valuestring);
+    }
+    const auto titleParts = splitShortcut(title);
+    SetWindowTextW(s.title, titleParts.first.c_str());
+    SetWindowTextW(s.shortcut, titleParts.second.c_str());
+    if (node && node->kind == NodeKind::Script) {
+        cJSON* value = member(node->value, "script");
+        SetWindowTextW(s.script, cJSON_IsString(value) ? fromUtf8(value->valuestring).c_str() : L"");
+    }
+    if (node && node->kind == NodeKind::Action) {
+        cJSON* value = member(node->value, "action");
+        const std::wstring token = cJSON_IsString(value) ? fromUtf8(value->valuestring) : L"RUN_CURRENT_FILE";
+        fillActionCombo(s, token);
+        SetWindowTextW(s.actionTarget, token.rfind(L"MENU:", 0) == 0 ? token.substr(5).c_str() : L"");
+        showActionTargetControls(s, token.rfind(L"MENU:", 0) == 0);
+    }
+    if (node && node->kind == NodeKind::Execute) {
+        cJSON* execute = member(node->value, "execute");
+        cJSON* command = member(execute, "command");
+        SetWindowTextW(s.command, cJSON_IsString(command) ? fromUtf8(command->valuestring).c_str() : L"");
+        cJSON* save = member(execute, "save_before_run");
+        SendMessageW(s.saveBeforeRun, BM_SETCHECK, cJSON_IsTrue(save) ? BST_CHECKED : BST_UNCHECKED, 0);
+        cJSON* run = member(execute, "run_in");
+        fillRunIn(s, cJSON_IsString(run) ? fromUtf8(run->valuestring) : L"output_pane");
+        cJSON* codePage = member(execute, "code_page");
+        const std::wstring codePageText = cJSON_IsString(codePage) ? fromUtf8(codePage->valuestring) : L"ANSI";
+        const LRESULT codePageIndex = SendMessageW(s.codePage, CB_FINDSTRINGEXACT,
+                                                    static_cast<WPARAM>(-1),
+                                                    reinterpret_cast<LPARAM>(codePageText.c_str()));
+        if (codePageIndex != CB_ERR) SendMessageW(s.codePage, CB_SETCURSEL, codePageIndex, 0);
+        else SetWindowTextW(s.codePage, codePageText.c_str());
+        loadEnvironmentText(s, node);
+    } else {
+        s.environment.clear();
+    }
+    // Keep the last execute item's text while the shared control is hidden.
+    // Clearing it here makes the edit lose its visible contents on re-entry
+    // on some Windows repaint paths, even though the JSON still has the data.
+    s.currentIconPath.clear();
+    if (s.toolbarItem) {
+        cJSON* icon = member(node->value, "icon");
+        if (cJSON_IsString(icon)) s.currentIconPath = fromUtf8(icon->valuestring);
+    }
+    updateIconPreview(s);
+    const bool canCreate = node && (node->kind == NodeKind::MenuRoot || node->kind == NodeKind::ToolbarRoot ||
+        (submenu && node->parent != s.toolbar));
+    EnableWindow(s.newButton, canCreate);
+    EnableWindow(s.deleteButton, hasItem);
+    bool hasPrevious = false, hasNext = false;
+    if (node && node->parent && node->kind != NodeKind::MenuRoot && node->kind != NodeKind::ToolbarRoot) {
+        if (node->topMenu) { hasPrevious = node->value->prev != nullptr; hasNext = node->value->next != nullptr; }
+        else { hasPrevious = node->value->prev != nullptr; hasNext = node->value->next != nullptr; }
+    }
+    EnableWindow(s.upButton, hasPrevious);
+    EnableWindow(s.downButton, hasNext);
+    if (!hasItem) SetWindowTextW(s.info, tr(s, node && node->kind == NodeKind::ToolbarRoot ? "ConfigSelectToolbar" : "ConfigSelectMenu").c_str());
+    else if (separator) SetWindowTextW(s.info, tr(s, "ConfigSeparatorInfo").c_str());
+    s.updating = false;
+
+    if (s.activePage == 0 && s.activeItemForm)
+        showChildDialogAndRepaint(s.hwnd, s.activeItemForm);
+}
+
+static bool setObjectString(cJSON* object, const char* key, const std::wstring& value)
+{
+    return setString(object, key, value);
+}
+
+static bool commitSelected(EditorState& s);
+
+static bool commitSelected(EditorState& s)
+{
+    EditorNode* node = s.selected;
+    if (!node || node->kind == NodeKind::MenuRoot || node->kind == NodeKind::ToolbarRoot || node->kind == NodeKind::Separator) return true;
+    if (node->topMenu) {
+        std::wstring title = readText(s.title);
+        const std::wstring shortcut = readText(s.shortcut);
+        if (!shortcut.empty()) title += L"\t" + shortcut;
+        if (toUtf8(title) != (node->value->string ? node->value->string : "")) setPropertyName(node->value, title);
+        return true;
+    }
+    std::wstring title = readText(s.title);
+    const std::wstring shortcut = readText(s.shortcut);
+    if (!shortcut.empty()) title += L"\t" + shortcut;
+    if (!setObjectString(node->value, "title", title)) return false;
+    if (node->kind == NodeKind::Script) {
+        if (!setObjectString(node->value, "script", storedScriptPath(s.scriptFolder, readText(s.script)))) return false;
+    } else if (node->kind == NodeKind::Action) {
+        const LRESULT index = SendMessageW(s.action, CB_GETCURSEL, 0, 0);
+        const int actionKind = index == CB_ERR ? 1 : static_cast<int>(SendMessageW(s.action, CB_GETITEMDATA, index, 0));
+        std::wstring token;
+        if (actionKind == 1) token = L"RUN_CURRENT_FILE";
+        else if (actionKind == 2) token = L"STOP_SCRIPT";
+        else if (actionKind == 3) token = L"MENU:" + readText(s.actionTarget);
+        else token = L"CONFIGURE_MENU";
+        if (!setObjectString(node->value, "action", token)) return false;
+    } else if (node->kind == NodeKind::Execute) {
+        cJSON* execute = member(node->value, "execute");
+        if (!cJSON_IsObject(execute)) {
+            execute = cJSON_CreateObject();
+            if (!execute || !cJSON_AddItemToObject(node->value, "execute", execute)) return false;
+        }
+        if (!setObjectString(execute, "command", readText(s.command)) ||
+            !setBool(execute, "save_before_run", SendMessageW(s.saveBeforeRun, BM_GETCHECK, 0, 0) == BST_CHECKED) ||
+            !setObjectString(execute, "run_in", selectedRunIn(s)) ||
+            !setObjectString(execute, "code_page", readText(s.codePage))) return false;
+        if (!node->environmentTextLoaded) {
+            node->environmentText.clear();
+            node->environmentTextLoaded = true;
+        }
+        s.environment = parseEnvironmentText(node->environmentText);
+        cJSON_DeleteItemFromObjectCaseSensitive(execute, "env");
+        cJSON* env = cJSON_AddObjectToObject(execute, "env");
+        if (!env) return false;
+        for (const auto& pair : s.environment) {
+            const std::string key = toUtf8(pair.first), value = toUtf8(pair.second);
+            if (!cJSON_AddStringToObject(env, key.c_str(), value.c_str())) return false;
+        }
+    }
+    if (s.toolbarItem) {
+        if (s.currentIconPath.empty()) cJSON_DeleteItemFromObjectCaseSensitive(node->value, "icon");
+        else if (!setObjectString(node->value, "icon", s.currentIconPath)) return false;
+    }
+    return true;
+}
+
+static bool validateItems(EditorState& s, cJSON* items, unsigned int depth,
+                          const std::wstring& parentPath, std::wstring& error)
+{
+    if (!cJSON_IsArray(items) || depth > 16) {
+        error = tr(s, "ConfigInvalidJson") + L"\n\n" + parentPath;
+        return false;
+    }
+    for (cJSON* item = items->child; item; item = item->next) {
+        const std::wstring itemTitle = cJSON_IsString(member(item, "title"))
+            ? fromUtf8(member(item, "title")->valuestring) : L"(untitled item)";
+        const std::wstring itemPath = parentPath + L" > " + itemTitle;
+        if (!cJSON_IsObject(item)) {
+            error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
+            return false;
+        }
+        if (!item->child) continue;
+        cJSON* title = member(item, "title");
+        cJSON* script = member(item, "script");
+        cJSON* action = member(item, "action");
+        cJSON* execute = member(item, "execute");
+        cJSON* sub = member(item, "sub");
+        if (sub) {
+            if (!cJSON_IsString(title) || !title->valuestring || !title->valuestring[0] || !cJSON_IsArray(sub) || script || action || execute || depth == 16) {
+                error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
+                return false;
+            }
+            if (!validateItems(s, sub, depth + 1, itemPath, error)) return false;
+        } else {
+            if (!cJSON_IsString(title) || !title->valuestring || !title->valuestring[0] || static_cast<int>(!!script) + static_cast<int>(!!action) + static_cast<int>(!!execute) != 1) {
+                error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
+                return false;
+            }
+            if (script) {
+                if (!cJSON_IsString(script) || !script->valuestring || !*script->valuestring) {
+                    error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
+                    return false;
+                }
+                const std::wstring path = fromUtf8(script->valuestring);
+                const size_t dot = path.find_last_of(L'.');
+                if (dot == std::wstring::npos) {
+                    error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
+                    return false;
+                }
+                const std::wstring ext = path.substr(dot);
+                if (_wcsicmp(ext.c_str(), L".js") && _wcsicmp(ext.c_str(), L".mjs") && _wcsicmp(ext.c_str(), L".pl") && _wcsicmp(ext.c_str(), L".py")) {
+                    error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
+                    return false;
+                }
+            } else if (action) {
+                if (!cJSON_IsString(action) || !action->valuestring) {
+                    error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
+                    return false;
+                }
+                const std::wstring token = fromUtf8(action->valuestring);
+                if (token != L"RUN_CURRENT_FILE" && token != L"STOP_SCRIPT" && token != L"CONFIGURE_MENU" && token.rfind(L"MENU:", 0) != 0) {
+                    error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
+                    return false;
+                }
+                if (token.rfind(L"MENU:", 0) == 0 && token.size() <= 5) {
+                    error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
+                    return false;
+                }
+            } else {
+                cJSON* command = member(execute, "command");
+                cJSON* run = member(execute, "run_in");
+                if (!cJSON_IsObject(execute)) {
+                    error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
+                    return false;
+                }
+                if (!cJSON_IsString(command) || !command->valuestring || !command->valuestring[0]) {
+                    error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath +
+                            L"\n\nexecute.command must be a non-empty string.";
+                    return false;
+                }
+                if (!cJSON_IsString(run)) {
+                    error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath +
+                            L"\n\nexecute.run_in must be a string.";
+                    return false;
+                }
+                const std::wstring runValue = fromUtf8(run->valuestring);
+                if (runValue != L"output_pane" && runValue != L"console" && runValue != L"windows") {
+                    error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath +
+                            L"\n\nUnsupported execute.run_in value: " + runValue;
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool validateAndCommit(EditorState& s, std::wstring& error)
+{
+    if (!commitSelected(s)) { error = tr(s, "ConfigDuplicateMenuTitle"); return false; }
+    if (!cJSON_IsObject(s.root) || !cJSON_IsObject(s.menu)) { error = tr(s, "ConfigInvalidJson"); return false; }
+    for (cJSON* group = s.menu->child; group; group = group->next) {
+        for (cJSON* other = group->next; other; other = other->next)
+            if (group->string && other->string && std::strcmp(group->string, other->string) == 0) {
+                error = tr(s, "ConfigDuplicateMenuTitle"); return false;
+            }
+        const std::wstring groupPath = L"Menu > " + (group->string ? fromUtf8(group->string) : L"(unnamed menu)");
+        if (!group->string || !validateItems(s, group, 0, groupPath, error)) {
+            if (error.empty()) error = tr(s, "ConfigInvalidJson") + L"\n\n" + groupPath;
+            return false;
+        }
+    }
+    if (s.toolbar && !cJSON_IsArray(s.toolbar)) { error = tr(s, "ConfigInvalidJson"); return false; }
+    if (s.toolbar && cJSON_GetArraySize(s.toolbar) > 32) { error = tr(s, "ConfigInvalidJson"); return false; }
+    for (cJSON* item = s.toolbar ? s.toolbar->child : nullptr; item; item = item->next) {
+        if (!cJSON_IsObject(item) || !cJSON_IsString(member(item, "title"))) { error = tr(s, "ConfigInvalidJson"); return false; }
+        cJSON* script = member(item, "script"), *action = member(item, "action"), *execute = member(item, "execute");
+        if (static_cast<int>(!!script) + static_cast<int>(!!action) + static_cast<int>(!!execute) != 1) { error = tr(s, "ConfigInvalidJson"); return false; }
+        cJSON* icon = member(item, "icon");
+        if (icon) {
+            if (!cJSON_IsString(icon)) { error = tr(s, "ConfigInvalidJson"); return false; }
+            const std::wstring iconPath = fromUtf8(icon->valuestring);
+            if (iconPath.size() < 4 || _wcsicmp(iconPath.c_str() + iconPath.size() - 4, L".ico") != 0 ||
+                !fileExists(resolvedPath(s.iconFolder, iconPath))) {
+                error = tr(s, "ConfigIconMissing"); return false;
+            }
+        }
+    }
+    if (s.context.validate && !s.context.validate(s.root, error)) return false;
+    return true;
+}
+
+static bool saveFile(EditorState& s, std::wstring& error)
+{
+    if (!validateAndCommit(s, error)) return false;
+    char* printed = cJSON_Print(s.root);
+    if (!printed) { error = tr(s, "ConfigSaveFailed"); return false; }
+    const std::string bytes = std::string("\xEF\xBB\xBF") + printed;
+    std::free(printed);
+    const std::wstring tempPath = s.context.menuPath + L".tmp";
+    HANDLE file = CreateFileW(tempPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) { error = tr(s, "ConfigSaveFailed"); return false; }
+    DWORD written = 0;
+    const bool wrote = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) && written == bytes.size();
+    FlushFileBuffers(file);
+    CloseHandle(file);
+    if (!wrote || !MoveFileExW(tempPath.c_str(), s.context.menuPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tempPath.c_str()); error = tr(s, "ConfigSaveFailed"); return false;
+    }
+    s.dirty = false;
+    return true;
+}
+
+static bool saveAndRebuild(EditorState& s, std::wstring& error)
+{
+    if (!s.context.saveAndRebuild) {
+        error = tr(s, "ConfigRebuildFailed");
+        return false;
+    }
+    return s.context.saveAndRebuild(error);
+}
+
+static void showSaveError(EditorState& s, const std::wstring& error)
+{
+    if (!error.empty()) MessageBoxW(s.hwnd, error.c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONERROR);
+}
+
+static void chooseScriptFile(EditorState& s)
+{
+    wchar_t file[32768]{};
+    OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = s.hwnd;
+    ofn.lpstrFilter = L"Supported scripts (*.js;*.mjs;*.pl;*.py)\0*.js;*.mjs;*.pl;*.py\0All files (*.*)\0*.*\0\0";
+    ofn.lpstrFile = file; ofn.nMaxFile = static_cast<DWORD>(std::size(file)); ofn.lpstrInitialDir = s.scriptFolder.c_str();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+    if (GetOpenFileNameW(&ofn)) {
+        const std::wstring selected = storedScriptPath(s.scriptFolder, file);
+        SetWindowTextW(s.script, selected.c_str());
+        s.dirty = true;
+    }
+}
+
+static void editScriptFile(EditorState& s)
+{
+    const std::wstring scriptPath = readText(s.script);
+    const std::wstring path = resolvedPath(s.scriptFolder, scriptPath);
+    if (scriptPath.empty()) {
+        MessageBoxW(s.hwnd, tr(s, "ConfigScriptFileMissing").c_str(),
+                    tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (s.context.openOrCreateScript) {
+        s.context.openOrCreateScript(s.hwnd, path);
+        return;
+    }
+    if (!fileExists(path)) {
+        MessageBoxW(s.hwnd, tr(s, "ConfigScriptFileMissing").c_str(),
+                    tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING);
+        return;
+    }
+    SendMessageW(s.context.owner, NPPM_DOOPEN, 0, reinterpret_cast<LPARAM>(path.c_str()));
+}
+
+static void chooseIcon(EditorState& s)
+{
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, 1, tr(s, "ConfigChooseIcon").c_str());
+    AppendMenuW(menu, MF_STRING, 2, tr(s, "ConfigUseDefaultIcon").c_str());
+    RECT rect{}; GetWindowRect(s.icon, &rect);
+    const UINT choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, rect.left, rect.bottom, 0, s.hwnd, nullptr);
+    DestroyMenu(menu);
+    if (choice == 2) { s.currentIconPath.clear(); if (s.customIcon) { DestroyIcon(s.customIcon); s.customIcon = nullptr; } updateIconPreview(s); s.dirty = true; return; }
+    if (choice != 1) return;
+    wchar_t file[32768]{};
+    OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = s.hwnd;
+    ofn.lpstrFilter = L"Icon files (*.ico)\0*.ico\0\0"; ofn.lpstrFile = file;
+    ofn.nMaxFile = static_cast<DWORD>(std::size(file)); ofn.lpstrInitialDir = s.iconFolder.c_str();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+    if (!GetOpenFileNameW(&ofn)) return;
+    const std::wstring selected = fullPath(file);
+    if (selected.size() < 4 || _wcsicmp(selected.c_str() + selected.size() - 4, L".ico") != 0) {
+        MessageBoxW(s.hwnd, tr(s, "ConfigIconMissing").c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING); return;
+    }
+    HICON loaded = static_cast<HICON>(LoadImageW(nullptr, selected.c_str(), IMAGE_ICON, 32, 32, LR_LOADFROMFILE));
+    if (!loaded) { MessageBoxW(s.hwnd, tr(s, "ConfigIconMissing").c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING); return; }
+    if (s.customIcon) DestroyIcon(s.customIcon);
+    s.customIcon = loaded;
+    s.iconPreview = loaded;
+    s.currentIconPath = storedPath(s.iconFolder, selected);
+    InvalidateRect(s.icon, nullptr, TRUE);
+    s.dirty = true;
+}
+
+static bool commitSelected(EditorState& s);
+
+static bool addItem(EditorState& s, int choice)
+{
+    if (!s.selected || !IsWindowEnabled(s.newButton)) return false;
+    if (!commitSelected(s)) return false;
+    EditorNode* selected = s.selected;
+    if (selected->kind == NodeKind::MenuRoot) {
+        if (choice != ID_NEW_SUBMENU) return false;
+        std::string menuName = toUtf8(tr(s, "ConfigNewMenuDefault"));
+        if (menuName.empty()) menuName = "New Menu";
+        for (unsigned int suffix = 2; member(s.menu, menuName.c_str()); ++suffix)
+            menuName = toUtf8(tr(s, "ConfigNewMenuDefault")) + " " + std::to_string(suffix);
+        cJSON* items = cJSON_CreateArray();
+        if (!items || !cJSON_AddItemToObject(s.menu, menuName.c_str(), items)) { cJSON_Delete(items); return false; }
+        s.dirty = true;
+        rebuildTree(s, items);
+        return true;
+    }
+    if (selected->kind == NodeKind::ToolbarRoot && choice != ID_NEW_SCRIPT && choice != ID_NEW_EXECUTE && choice != ID_NEW_ACTION) return false;
+    if (selected->kind != NodeKind::ToolbarRoot && selected->kind != NodeKind::TopMenu && selected->kind != NodeKind::Submenu) return false;
+    if (selected->kind != NodeKind::ToolbarRoot && choice == ID_NEW_SUBMENU && selected->depth >= 17) return false;
+    cJSON* selectedArray = selected->kind == NodeKind::ToolbarRoot ? s.toolbar :
+        selected->kind == NodeKind::TopMenu ? selected->value : member(selected->value, "sub");
+    if (selected->kind == NodeKind::ToolbarRoot && !selectedArray) {
+        selectedArray = cJSON_AddArrayToObject(s.root, "toolbar");
+        s.toolbar = selectedArray;
+    }
+    if (!selectedArray) return false;
+    cJSON* newItem = nullptr;
+    if (choice == ID_NEW_SEPARATOR) newItem = cJSON_CreateObject();
+    else if (choice == ID_NEW_SUBMENU) {
+        newItem = cJSON_CreateObject();
+        if (newItem) {
+            const std::string defaultTitle = toUtf8(tr(s, "ConfigNewSubmenuDefault"));
+            cJSON_AddStringToObject(newItem, "title", defaultTitle.empty() ? "New Submenu" : defaultTitle.c_str());
+            cJSON_AddArrayToObject(newItem, "sub");
+        }
+    } else {
+        newItem = cJSON_CreateObject();
+        if (!newItem) return false;
+        const std::string defaultTitle = toUtf8(tr(s, "ConfigNewItemDefault"));
+        cJSON_AddStringToObject(newItem, "title", defaultTitle.empty() ? "New Item" : defaultTitle.c_str());
+        if (choice == ID_NEW_SCRIPT) cJSON_AddStringToObject(newItem, "script", "");
+        else if (choice == ID_NEW_ACTION) cJSON_AddStringToObject(newItem, "action", "RUN_CURRENT_FILE");
+        else if (choice == ID_NEW_EXECUTE) {
+            cJSON* execute = cJSON_AddObjectToObject(newItem, "execute");
+            cJSON_AddStringToObject(execute, "command", "");
+            cJSON_AddBoolToObject(execute, "save_before_run", 0);
+            cJSON_AddStringToObject(execute, "code_page", "ANSI");
+            cJSON_AddStringToObject(execute, "run_in", "output_pane");
+            cJSON_AddObjectToObject(execute, "env");
+        }
+    }
+    if (!newItem) return false;
+    if (!cJSON_AddItemToArray(selectedArray, newItem)) { cJSON_Delete(newItem); return false; }
+    s.dirty = true;
+    rebuildTree(s, newItem);
+    return true;
+}
+
+static bool reorderLinked(cJSON* parent, cJSON* item, bool up)
+{
+    if (!parent || !item) return false;
+    cJSON* left = up ? item->prev : item;
+    cJSON* right = up ? item : item->next;
+    if (!left || !right) return false;
+    cJSON* before = left->prev;
+    cJSON* after = right->next;
+    if (before) before->next = right; else parent->child = right;
+    right->prev = before;
+    right->next = left;
+    left->prev = right;
+    left->next = after;
+    if (after) after->prev = left;
+    return true;
+}
+
+static void moveSelected(EditorState& s, bool up)
+{
+    EditorNode* node = s.selected;
+    if (!node || !node->parent || !commitSelected(s)) return;
+    bool moved = false;
+    if (node->topMenu) moved = reorderLinked(node->parent, node->value, up);
+    else {
+        const int count = cJSON_GetArraySize(node->parent);
+        int index = -1;
+        for (int i = 0; i < count; ++i) if (cJSON_GetArrayItem(node->parent, i) == node->value) { index = i; break; }
+        const int target = index + (up ? -1 : 1);
+        if (index >= 0 && target >= 0 && target < count) {
+            cJSON* detached = cJSON_DetachItemFromArray(node->parent, index);
+            moved = detached && cJSON_InsertItemInArray(node->parent, target, detached);
+        }
+    }
+    if (moved) { s.dirty = true; rebuildTree(s, node->value); }
+}
+
+static void deleteSelected(EditorState& s)
+{
+    EditorNode* node = s.selected;
+    if (!node || !node->parent || node->kind == NodeKind::MenuRoot || node->kind == NodeKind::ToolbarRoot || !commitSelected(s)) return;
+    if (MessageBoxW(s.hwnd, tr(s, "ConfigDeleteConfirm").c_str(), tr(s, "ConfigTitle").c_str(), MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    cJSON* parent = node->parent;
+    cJSON* selection = parent == s.menu || parent == s.toolbar ? parent : nullptr;
+    for (const auto& candidate : s.nodes) {
+        if (!selection && candidate.get() != node && candidate->kind == NodeKind::Submenu && member(candidate->value, "sub") == parent)
+            selection = candidate->value;
+        if (!selection && candidate.get() != node && candidate->kind == NodeKind::TopMenu && candidate->value == parent)
+            selection = candidate->value;
+    }
+    cJSON* detached = cJSON_DetachItemViaPointer(parent, node->value);
+    if (detached) cJSON_Delete(detached);
+    s.dirty = true;
+    rebuildTree(s, selection);
+}
+
+static void showTreeContextMenu(EditorState& s, POINT screenPoint)
+{
+    POINT client = screenPoint;
+    ScreenToClient(s.tree, &client);
+    TVHITTESTINFO hit{};
+    hit.pt = client;
+    const HTREEITEM item = TreeView_HitTest(s.tree, &hit);
+    if (!item) return;
+
+    if (TreeView_GetSelection(s.tree) != item) {
+        if (!commitSelected(s)) {
+            MessageBoxW(s.hwnd, tr(s, "ConfigDuplicateMenuTitle").c_str(), tr(s, "ConfigTitle").c_str(),
+                        MB_OK | MB_ICONWARNING);
+            return;
+        }
+        TreeView_SelectItem(s.tree, item);
+    }
+
+    EditorNode* node = treeNode(s, item);
+    if (!node) return;
+    const bool menuRoot = node->kind == NodeKind::MenuRoot;
+    const bool toolbarRoot = node->kind == NodeKind::ToolbarRoot;
+    const bool hasItem = node->parent && !menuRoot && !toolbarRoot;
+    const bool canCreate = IsWindowEnabled(s.newButton) != FALSE;
+
+    HMENU contextMenu = CreatePopupMenu();
+    HMENU newMenu = CreatePopupMenu();
+    if (!contextMenu || !newMenu) {
+        if (contextMenu) DestroyMenu(contextMenu);
+        if (newMenu) DestroyMenu(newMenu);
+        return;
+    }
+    AppendMenuW(newMenu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_SCRIPT, tr(s, "ConfigScript").c_str());
+    AppendMenuW(newMenu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_EXECUTE, tr(s, "ConfigExecute").c_str());
+    AppendMenuW(newMenu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_ACTION, tr(s, "ConfigAction").c_str());
+    AppendMenuW(newMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(newMenu, MF_STRING | ((menuRoot || toolbarRoot) ? MF_GRAYED : 0),
+                ID_NEW_SEPARATOR, tr(s, "ConfigSeparator").c_str());
+    const bool submenuDisabled = toolbarRoot || (node && node->depth >= 17);
+    AppendMenuW(newMenu, MF_STRING | (submenuDisabled ? MF_GRAYED : 0),
+                ID_NEW_SUBMENU, tr(s, "ConfigSubmenu").c_str());
+    AppendMenuW(contextMenu, MF_POPUP | (canCreate ? 0 : MF_GRAYED),
+                reinterpret_cast<UINT_PTR>(newMenu), tr(s, "ConfigNew").c_str());
+    AppendMenuW(contextMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(contextMenu, MF_STRING | (hasItem ? 0 : MF_GRAYED), ID_DELETE,
+                tr(s, "ConfigDelete").c_str());
+
+    SetForegroundWindow(s.hwnd);
+    const UINT command = TrackPopupMenu(contextMenu, TPM_RETURNCMD | TPM_NONOTIFY,
+                                        screenPoint.x, screenPoint.y, 0, s.hwnd, nullptr);
+    DestroyMenu(contextMenu);
+    if (command == ID_DELETE) deleteSelected(s);
+    else if (command >= ID_NEW_SCRIPT && command <= ID_NEW_SUBMENU)
+        addItem(s, static_cast<int>(command));
+}
+
+static void addEnvironment(EditorState& s)
+{
+    const std::wstring name = readText(s.envName), value = readText(s.envValue);
+    if (name.empty() || name.find(L'=') != std::wstring::npos) return;
+    s.environment[name] = value;
+    refreshEnvironment(s);
+    s.dirty = true;
+}
+
+static int CALLBACK folderBrowseCallback(HWND hwnd, UINT message, LPARAM, LPARAM data)
+{
+    if (message == BFFM_INITIALIZED && data)
+        SendMessageW(hwnd, BFFM_SETSELECTIONW, TRUE, data);
+    return FALSE;
+}
+
+static RECT shortcutClearHitRect(HWND hwnd)
+{
+    RECT rect{};
+    GetClientRect(hwnd, &rect);
+    rect.left = std::max(rect.left, rect.right - 20);
+    rect.right -= 2;
+    ++rect.top;
+    --rect.bottom;
+    return rect;
+}
+
+static LRESULT CALLBACK shortcutSubclass(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
+                                         UINT_PTR, DWORD_PTR data)
+{
+    auto* state = reinterpret_cast<EditorState*>(data);
+    if (message == WM_PAINT && state) {
+        const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
+        HDC dc = GetDC(hwnd);
+        if (dc) {
+            RECT rect{};
+            if (GetClientRect(hwnd, &rect)) {
+                if (GetWindowTextLengthW(hwnd) == 0) {
+                    const DWORD margins = static_cast<DWORD>(SendMessageW(hwnd, EM_GETMARGINS, 0, 0));
+                    rect.left += LOWORD(margins) + 1;
+                    rect.right -= HIWORD(margins) + 2;
+                    HGDIOBJ oldFont = state->shortcutPlaceholderFont
+                        ? SelectObject(dc, state->shortcutPlaceholderFont) : nullptr;
+                    SetBkMode(dc, TRANSPARENT);
+                    SetTextColor(dc, RGB(160, 160, 160));
+                    DrawTextW(dc, state->shortcutHintText.c_str(),
+                              static_cast<int>(state->shortcutHintText.size()), &rect,
+                              DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+                    if (oldFont) SelectObject(dc, oldFont);
+                } else {
+                    const RECT clearRect = shortcutClearHitRect(hwnd);
+                    const int centerX = (clearRect.left + clearRect.right) / 2;
+                    const int centerY = (clearRect.top + clearRect.bottom) / 2;
+                    RECT glyphRect{centerX - 12, centerY - 13, centerX + 12, centerY + 11};
+                    HGDIOBJ oldFont = state->shortcutClearFont
+                        ? SelectObject(dc, state->shortcutClearFont) : nullptr;
+                    SetBkMode(dc, TRANSPARENT);
+                    SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+                    DrawTextW(dc, L"×", 1, &glyphRect,
+                              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                    if (oldFont) SelectObject(dc, oldFont);
+                }
+            }
+            ReleaseDC(hwnd, dc);
+        }
+        return result;
+    }
+    if (message == WM_SETCURSOR && state && GetWindowTextLengthW(hwnd) > 0) {
+        POINT point{};
+        GetCursorPos(&point);
+        ScreenToClient(hwnd, &point);
+        const RECT clearRect = shortcutClearHitRect(hwnd);
+        if (PtInRect(&clearRect, point)) {
+            SetCursor(LoadCursor(nullptr, IDC_HAND));
+            return TRUE;
+        }
+    }
+    if (message == WM_LBUTTONDOWN && state && GetWindowTextLengthW(hwnd) > 0) {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const RECT clearRect = shortcutClearHitRect(hwnd);
+        if (PtInRect(&clearRect, point)) {
+            state->shortcutClearPressed = true;
+            SetCapture(hwnd);
+            SetFocus(hwnd);
+            return 0;
+        }
+    }
+    if (message == WM_LBUTTONUP && state && state->shortcutClearPressed) {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const RECT clearRect = shortcutClearHitRect(hwnd);
+        state->shortcutClearPressed = false;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        if (PtInRect(&clearRect, point)) {
+            SetWindowTextW(hwnd, L"");
+            state->dirty = true;
+            PostMessageW(state->hwnd, TITLE_REFRESH_MESSAGE, 0, 0);
+        }
+        InvalidateRect(hwnd, nullptr, TRUE);
+        return 0;
+    }
+    if (message == WM_CAPTURECHANGED && state) state->shortcutClearPressed = false;
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && state) {
+        const UINT key = static_cast<UINT>(wParam);
+        if (key == VK_ESCAPE) {
+            SetWindowTextW(hwnd, L"");
+            state->dirty = true;
+            PostMessageW(state->hwnd, TITLE_REFRESH_MESSAGE, 0, 0);
+            return 0;
+        }
+        if (key == VK_CONTROL || key == VK_SHIFT || key == VK_MENU) return 0;
+        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+        const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        const bool validKey = (key >= 'A' && key <= 'Z') || (key >= '0' && key <= '9') || (key >= VK_F1 && key <= VK_F24);
+        if (!validKey || (!ctrl && !alt && !shift)) {
+            MessageBoxW(state->hwnd, tr(*state, "ConfigInvalidShortcut").c_str(), tr(*state, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING);
+            return 0;
+        }
+        std::wstring text;
+        if (ctrl) text += L"Ctrl+";
+        if (alt) text += L"Alt+";
+        if (shift) text += L"Shift+";
+        if (key >= VK_F1 && key <= VK_F24) text += L"F" + std::to_wstring(key - VK_F1 + 1);
+        else text += static_cast<wchar_t>(key);
+        SetWindowTextW(hwnd, text.c_str());
+        state->dirty = true;
+        PostMessageW(state->hwnd, TITLE_REFRESH_MESSAGE, 0, 0);
+        return 0;
+    }
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(hwnd, shortcutSubclass, 1);
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
+static LRESULT CALLBACK singleLineEditInsetSubclass(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
+                                                     UINT_PTR subclassId, DWORD_PTR)
+{
+    if (message == WM_NCCALCSIZE) {
+        const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
+        if (wParam) {
+            auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+            if (params) ++params->rgrc[0].top;
+        } else {
+            auto* client = reinterpret_cast<RECT*>(lParam);
+            if (client) ++client->top;
+        }
+        return result;
+    }
+    if (message == WM_NCPAINT) {
+        const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
+        RECT windowRect{}, clientRect{};
+        if (GetWindowRect(hwnd, &windowRect) && GetClientRect(hwnd, &clientRect)) {
+            MapWindowPoints(hwnd, nullptr, reinterpret_cast<POINT*>(&clientRect), 2);
+            const int width = windowRect.right - windowRect.left;
+            const int clientTop = clientRect.top - windowRect.top;
+            const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            const int borderX = (exStyle & WS_EX_CLIENTEDGE) ? GetSystemMetrics(SM_CXEDGE) :
+                                ((style & WS_BORDER) ? GetSystemMetrics(SM_CXBORDER) : 0);
+            const int borderY = (exStyle & WS_EX_CLIENTEDGE) ? GetSystemMetrics(SM_CYEDGE) :
+                                ((style & WS_BORDER) ? GetSystemMetrics(SM_CYBORDER) : 0);
+            if (clientTop > borderY) {
+                HDC dc = GetWindowDC(hwnd);
+                if (dc) {
+                    RECT gap{borderX, borderY, width - borderX, clientTop};
+                    FillRect(dc, &gap, GetSysColorBrush(COLOR_WINDOW));
+                    ReleaseDC(hwnd, dc);
+                }
+            }
+        }
+        return result;
+    }
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(hwnd, singleLineEditInsetSubclass, subclassId);
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
+static void applySingleLineEditInsets(HWND hwnd)
+{
+    if (!hwnd) return;
+    static constexpr wchar_t propertyName[] = L"NppMenuScripts.SingleLineEditInsets";
+    if (GetPropW(hwnd, propertyName)) return;
+
+    const DWORD margins = static_cast<DWORD>(SendMessageW(hwnd, EM_GETMARGINS, 0, 0));
+    const WORD left = static_cast<WORD>(LOWORD(margins) + 2);
+    SendMessageW(hwnd, EM_SETMARGINS, EC_LEFTMARGIN, MAKELONG(left, HIWORD(margins)));
+    if (SetWindowSubclass(hwnd, singleLineEditInsetSubclass, 1, 0)) {
+        SetPropW(hwnd, propertyName, reinterpret_cast<HANDLE>(1));
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+}
+
+static void applyMultilineEditInsets(HWND hwnd)
+{
+    if (!hwnd) return;
+    RECT rect{};
+    SendMessageW(hwnd, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&rect));
+    rect.left += 2;
+    rect.top += 1;
+    SendMessageW(hwnd, EM_SETRECT, 0, reinterpret_cast<LPARAM>(&rect));
+    InvalidateRect(hwnd, nullptr, TRUE);
+}
+
+static LRESULT CALLBACK helpLinkSubclass(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
+                                         UINT_PTR subclassId, DWORD_PTR data)
+{
+    auto* state = reinterpret_cast<EditorState*>(data);
+    if (message == WM_PAINT && state) {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(hwnd, &paint);
+        if (dc) {
+            RECT rect{};
+            if (GetClientRect(hwnd, &rect)) {
+                HGDIOBJ oldFont = state->font ? SelectObject(dc, state->font) : nullptr;
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, GetSysColor(COLOR_HOTLIGHT));
+                DrawTextW(dc, L"(?)", 3, &rect,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                if (oldFont) SelectObject(dc, oldFont);
+            }
+            EndPaint(hwnd, &paint);
+        }
+        return 0;
+    }
+    if (message == WM_SETCURSOR) {
+        SetCursor(LoadCursor(nullptr, IDC_HAND));
+        return TRUE;
+    }
+    if (message == WM_KEYDOWN && (wParam == VK_RETURN || wParam == VK_SPACE)) {
+        SendMessageW(GetParent(hwnd), WM_COMMAND,
+                     MAKEWPARAM(GetDlgCtrlID(hwnd), BN_CLICKED), reinterpret_cast<LPARAM>(hwnd));
+        return 0;
+    }
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(hwnd, helpLinkSubclass, subclassId);
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
+static std::wstring browseFolder(EditorState& s, const std::wstring& initial, const char* titleKey)
+{
+    const std::wstring title = tr(s, titleKey);
+    BROWSEINFOW info{};
+    info.hwndOwner = s.hwnd;
+    info.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
+    info.lpszTitle = title.c_str();
+    info.lpfn = folderBrowseCallback;
+    info.lParam = reinterpret_cast<LPARAM>(initial.c_str());
+    PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&info);
+    if (!item) return {};
+    wchar_t path[MAX_PATH * 4]{};
+    const bool ok = SHGetPathFromIDListW(item, path) != FALSE;
+    CoTaskMemFree(item);
+    return ok ? fullPath(path) : std::wstring();
+}
+
+static bool isDirectory(const std::wstring& path)
+{
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static void showEditorPage(EditorState& s, int page)
+{
+    const bool pageChanged = page != s.activePage;
+    SendMessageW(s.tab, TCM_SETCURSEL, page, 0);
+    s.activePage = page;
+    for (HWND form : {s.emptyForm, s.scriptForm, s.actionForm, s.executeForm,
+                      s.submenuForm, s.separatorForm}) show(form, false);
+    show(s.settingsForm, false);
+    show(s.header, page == 0);
+    if (pageChanged) {
+        RECT displayArea{};
+        if (s.tab && GetClientRect(s.tab, &displayArea)) {
+            SendMessageW(s.tab, TCM_ADJUSTRECT, FALSE, reinterpret_cast<LPARAM>(&displayArea));
+            MapWindowPoints(s.tab, s.hwnd, reinterpret_cast<POINT*>(&displayArea), 2);
+            InvalidateRect(s.hwnd, &displayArea, TRUE);
+        }
+    }
+    if (page != 0) {
+        show(s.newButton, false); show(s.deleteButton, false);
+        show(s.upButton, false); show(s.downButton, false); show(s.tree, false);
+    }
+    if (page == 0) {
+        show(s.newButton, true);
+        show(s.deleteButton, true);
+        show(s.upButton, true);
+        show(s.downButton, true);
+        show(s.tree, true);
+        loadSelected(s, s.selected);
+        UpdateWindow(s.hwnd);
+        SetFocus(s.tree);
+    } else {
+        showChildDialogAndRepaint(s.hwnd, s.settingsForm);
+        SetFocus(s.workspaceSet);
+    }
+}
+
+static void refreshSettingsPaths(EditorState& s)
+{
+    SetWindowTextW(s.workspacePath, s.workspaceFolder.c_str());
+    SetWindowTextW(s.menuJsonPath, s.context.menuPath.c_str());
+    SetWindowTextW(s.scriptFolderPath, displayedFolderPath(s.workspaceFolder, s.scriptFolder).c_str());
+    SetWindowTextW(s.iconFolderPath, displayedFolderPath(s.workspaceFolder, s.iconFolder).c_str());
+}
+
+static void openFolder(EditorState& s, const std::wstring& path)
+{
+    if (path.empty() || !isDirectory(path)) {
+        MessageBoxW(s.hwnd, tr(s, "ConfigFolderMissing").c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING);
+        return;
+    }
+    const HINSTANCE result = ShellExecuteW(s.hwnd, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(result) <= 32)
+        MessageBoxW(s.hwnd, tr(s, "ConfigFolderOpenFailed").c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING);
+}
+
+static bool confirmPendingChanges(EditorState& s)
+{
+    if (!s.dirty) return true;
+    const int answer = MessageBoxW(s.hwnd, tr(s, "ConfigUnsavedPrompt").c_str(),
+                                  tr(s, "ConfigTitle").c_str(), MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (answer == IDCANCEL) return false;
+    if (answer == IDYES) {
+        std::wstring error;
+        if (!saveFile(s, error)) { showSaveError(s, error); return false; }
+        if (!saveAndRebuild(s, error)) { showSaveError(s, error); return false; }
+    }
+    return true;
+}
+
+static void onCommand(EditorState& s, int id, int notification)
+{
+    if (id == ID_NEW && notification == BN_CLICKED) {
+        HMENU menu = CreatePopupMenu();
+        const bool menuRoot = s.selected && s.selected->kind == NodeKind::MenuRoot;
+        const bool toolbarRoot = s.selected && s.selected->kind == NodeKind::ToolbarRoot;
+        AppendMenuW(menu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_SCRIPT, tr(s, "ConfigScript").c_str());
+        AppendMenuW(menu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_EXECUTE, tr(s, "ConfigExecute").c_str());
+        AppendMenuW(menu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_ACTION, tr(s, "ConfigAction").c_str());
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING | ((menuRoot || toolbarRoot) ? MF_GRAYED : 0), ID_NEW_SEPARATOR, tr(s, "ConfigSeparator").c_str());
+        const bool submenuDisabled = toolbarRoot || (s.selected && s.selected->depth >= 17);
+        AppendMenuW(menu, MF_STRING | (submenuDisabled ? MF_GRAYED : 0), ID_NEW_SUBMENU, tr(s, "ConfigSubmenu").c_str());
+        RECT rect{}; GetWindowRect(s.newButton, &rect);
+        const UINT selection = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, rect.left, rect.bottom, 0, s.hwnd, nullptr);
+        DestroyMenu(menu);
+        if (selection) addItem(s, static_cast<int>(selection));
+    } else if (id == ID_DELETE && notification == BN_CLICKED) deleteSelected(s);
+    else if (id == ID_UP && notification == BN_CLICKED) moveSelected(s, true);
+    else if (id == ID_DOWN && notification == BN_CLICKED) moveSelected(s, false);
+    else if (id == ID_SAVE_REBUILD && notification == BN_CLICKED) {
+        std::wstring error;
+        if (!saveFile(s, error)) { MessageBoxW(s.hwnd, error.c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONERROR); return; }
+        if (!saveAndRebuild(s, error)) { showSaveError(s, error); return; }
+    } else if (id == ID_CANCEL && notification == BN_CLICKED) {
+        if (s.dirty) {
+            const int answer = MessageBoxW(s.hwnd, tr(s, "ConfigUnsavedPrompt").c_str(), tr(s, "ConfigTitle").c_str(), MB_YESNOCANCEL | MB_ICONQUESTION);
+            if (answer == IDCANCEL) return;
+            if (answer == IDYES) {
+                std::wstring error;
+                if (!saveFile(s, error)) { MessageBoxW(s.hwnd, error.c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONERROR); return; }
+                if (!saveAndRebuild(s, error)) { showSaveError(s, error); return; }
+            }
+        }
+        EndDialog(s.hwnd, IDCANCEL);
+    } else if (!s.updating && id == ID_RUN_IN && notification == CBN_SELCHANGE) s.dirty = true;
+    else if (!s.updating && id == ID_CODE_PAGE && (notification == CBN_SELCHANGE || notification == CBN_EDITCHANGE)) s.dirty = true;
+    else if (!s.updating && id == ID_SAVE_BEFORE_RUN && notification == BN_CLICKED) s.dirty = true;
+    else if (id == ID_SCRIPT_BROWSE && notification == BN_CLICKED) chooseScriptFile(s);
+    else if (id == ID_SCRIPT_EDIT && notification == BN_CLICKED) editScriptFile(s);
+    else if (id == ID_ICON && notification == BN_CLICKED) chooseIcon(s);
+    else if (id == ID_WORKSPACE_SET && notification == BN_CLICKED) {
+        if (!confirmPendingChanges(s)) return;
+        if (s.context.chooseWorkspaceFolder && s.context.chooseWorkspaceFolder(s.hwnd))
+            EndDialog(s.hwnd, CONFIG_EDITOR_WORKSPACE_CHANGED_RESULT);
+    } else if (id == ID_WORKSPACE_OPEN && notification == BN_CLICKED) openFolder(s, s.workspaceFolder);
+    else if (id == ID_MENU_JSON_OPEN && notification == BN_CLICKED) {
+        if (!fileExists(s.context.menuPath)) {
+            MessageBoxW(s.hwnd, tr(s, "MenuJsonMissing").c_str(),
+                        tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONERROR);
+            return;
+        }
+        SendMessageW(s.context.owner, NPPM_DOOPEN, 0,
+                     reinterpret_cast<LPARAM>(s.context.menuPath.c_str()));
+    }
+    else if (id == ID_SCRIPT_FOLDER_SET && notification == BN_CLICKED) {
+        const std::wstring selected = browseFolder(s, s.scriptFolder, "ConfigSelectScriptFolder");
+        if (selected.empty()) return;
+        if (!isDirectory(selected)) { MessageBoxW(s.hwnd, tr(s, "ConfigFolderMissing").c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING); return; }
+        if (!setString(s.root, "script_folder", storedPath(s.workspaceFolder, selected))) { MessageBoxW(s.hwnd, tr(s, "ConfigSaveFailed").c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONERROR); return; }
+        s.scriptFolder = selected;
+        s.context.scriptFolder = selected;
+        refreshSettingsPaths(s);
+        s.dirty = true;
+    } else if (id == ID_SCRIPT_FOLDER_OPEN && notification == BN_CLICKED) openFolder(s, s.scriptFolder);
+    else if (id == ID_ICON_FOLDER_SET && notification == BN_CLICKED) {
+        const std::wstring selected = browseFolder(s, s.iconFolder, "ConfigSelectIconFolder");
+        if (selected.empty()) return;
+        if (!isDirectory(selected)) { MessageBoxW(s.hwnd, tr(s, "ConfigFolderMissing").c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING); return; }
+        if (!setString(s.root, "icon_folder", storedPath(s.workspaceFolder, selected))) { MessageBoxW(s.hwnd, tr(s, "ConfigSaveFailed").c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONERROR); return; }
+        s.iconFolder = selected;
+        s.context.iconFolder = selected;
+        refreshSettingsPaths(s);
+        updateIconPreview(s);
+        s.dirty = true;
+    } else if (id == ID_ICON_FOLDER_OPEN && notification == BN_CLICKED) openFolder(s, s.iconFolder);
+    else if (id == ID_TITLE && notification == EN_CHANGE && !s.updating) {
+        s.dirty = true;
+        SetTimer(s.hwnd, TITLE_REFRESH_TIMER, 180, nullptr);
+    } else if (id == ID_TITLE && notification == EN_KILLFOCUS && !s.updating) {
+        KillTimer(s.hwnd, TITLE_REFRESH_TIMER);
+        PostMessageW(s.hwnd, TITLE_REFRESH_MESSAGE, 0, 0);
+    } else if (id == ID_ENV_LIST && notification == EN_CHANGE && !s.updating) {
+        if (s.selected && s.selected->kind == NodeKind::Execute) {
+            s.selected->environmentText = readText(s.envList);
+            s.selected->environmentTextLoaded = true;
+        }
+        s.dirty = true;
+    } else if (!s.updating && notification == EN_CHANGE) s.dirty = true;
+}
+
+static void addControlFont(EditorState& s, HWND parent)
+{
+    if (!parent || !s.font) return;
+    SendMessageW(parent, WM_SETFONT, reinterpret_cast<WPARAM>(s.font), TRUE);
+}
+
+static std::wstring escapeButtonMnemonics(std::wstring text)
+{
+    size_t position = 0;
+    while ((position = text.find(L'&', position)) != std::wstring::npos) {
+        text.insert(position, 1, L'&');
+        position += 2;
+    }
+    return text;
+}
+
+static bool drawComboItem(const DRAWITEMSTRUCT& draw)
+{
+    if (draw.CtlType != ODT_COMBOBOX ||
+        (draw.CtlID != ID_ACTION && draw.CtlID != ID_RUN_IN && draw.CtlID != ID_CODE_PAGE)) return false;
+
+    const int index = draw.itemID == static_cast<UINT>(-1)
+        ? static_cast<int>(SendMessageW(draw.hwndItem, CB_GETCURSEL, 0, 0))
+        : static_cast<int>(draw.itemID);
+    std::wstring text;
+    if (index >= 0) {
+        const LRESULT length = SendMessageW(draw.hwndItem, CB_GETLBTEXTLEN, index, 0);
+        if (length >= 0) {
+            text.resize(static_cast<size_t>(length) + 1);
+            const LRESULT copied = SendMessageW(draw.hwndItem, CB_GETLBTEXT, index,
+                                                reinterpret_cast<LPARAM>(text.data()));
+            if (copied >= 0) text.resize(static_cast<size_t>(copied));
+            else text.clear();
+        }
+    }
+
+    const bool selected = (draw.itemState & ODS_SELECTED) != 0;
+    FillRect(draw.hDC, &draw.rcItem,
+             GetSysColorBrush(selected ? COLOR_HIGHLIGHT : COLOR_WINDOW));
+    SetBkMode(draw.hDC, TRANSPARENT);
+    SetTextColor(draw.hDC, GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT));
+    RECT textRect = draw.rcItem;
+    textRect.left += 5;
+    textRect.right -= 3;
+    DrawTextW(draw.hDC, text.c_str(), static_cast<int>(text.size()), &textRect,
+              DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+    return true;
+}
+
+static bool drawHelpLink(const DRAWITEMSTRUCT& draw)
+{
+    if (draw.CtlType != ODT_BUTTON ||
+        (draw.CtlID != ID_COMMAND_HELP && draw.CtlID != ID_ENV_HELP)) return false;
+    FillRect(draw.hDC, &draw.rcItem, GetSysColorBrush(COLOR_BTNFACE));
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(draw.hwndItem, WM_GETFONT, 0, 0));
+    HGDIOBJ oldFont = font ? SelectObject(draw.hDC, font) : nullptr;
+    SetBkMode(draw.hDC, TRANSPARENT);
+    SetTextColor(draw.hDC, GetSysColor(COLOR_HOTLIGHT));
+    RECT textRect = draw.rcItem;
+    DrawTextW(draw.hDC, L"(?)", 3, &textRect,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (oldFont) SelectObject(draw.hDC, oldFont);
+    return true;
+}
+
+static void positionHelpLink(EditorState& s, HWND label, HWND field, HWND link)
+{
+    if (!label || !field || !link) return;
+    RECT labelRect{}, fieldRect{};
+    if (!GetWindowRect(label, &labelRect) || !GetWindowRect(field, &fieldRect)) return;
+    HWND form = GetParent(label);
+    MapWindowPoints(nullptr, form, reinterpret_cast<POINT*>(&labelRect), 2);
+    MapWindowPoints(nullptr, form, reinterpret_cast<POINT*>(&fieldRect), 2);
+
+    const std::wstring text = readText(label);
+    HDC dc = GetDC(form);
+    SIZE textSize{};
+    if (dc) {
+        HGDIOBJ oldFont = SelectObject(dc, s.font);
+        GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &textSize);
+        if (oldFont) SelectObject(dc, oldFont);
+        ReleaseDC(form, dc);
+    }
+    constexpr int linkWidth = 16;
+    constexpr int linkHeight = 12;
+    int x = labelRect.left + textSize.cx + 3;
+    int y = labelRect.top + ((labelRect.bottom - labelRect.top) - linkHeight) / 2;
+    if (x + linkWidth > fieldRect.left - 2) {
+        x = labelRect.left;
+        y = labelRect.bottom + 1;
+    }
+    x -= 2;
+    y -= 5;
+    SetWindowPos(link, nullptr, x, y, linkWidth, linkHeight,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static INT_PTR CALLBACK pageDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    auto* s = reinterpret_cast<EditorState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_INITDIALOG) {
+        s = reinterpret_cast<EditorState*>(lParam);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(s));
+    }
+    if (!s) return FALSE;
+    switch (message) {
+    case WM_COMMAND: case WM_NOTIFY: case WM_DRAWITEM: case WM_MEASUREITEM: case WM_HSCROLL:
+        return SendMessageW(s->hwnd, message, wParam, lParam);
+    }
+    return FALSE;
+}
+
+static HWND createPageForm(EditorState& s, int resourceId)
+{
+    return CreateDialogParamW(s.context.module, MAKEINTRESOURCEW(resourceId), s.hwnd,
+                              pageDialogProc, reinterpret_cast<LPARAM>(&s));
+}
+
+static void layoutPageForm(EditorState& s, HWND form, const RECT& bounds)
+{
+    if (!form || bounds.right <= bounds.left || bounds.bottom <= bounds.top) return;
+
+    struct ChildPlacement { HWND hwnd; RECT dialogRect; };
+    std::vector<ChildPlacement> children;
+    for (HWND child = GetWindow(form, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+        RECT rect{};
+        if (!GetWindowRect(child, &rect)) continue;
+        MapWindowPoints(nullptr, s.hwnd, reinterpret_cast<POINT*>(&rect), 2);
+        children.push_back({child, rect});
+    }
+
+    // The dialog templates retain their original main-dialog coordinates.
+    // Place each page dialog in its real page rectangle, then translate its
+    // controls by the same origin so their visible positions do not change.
+    SetWindowPos(form, HWND_TOP, bounds.left, bounds.top,
+                 bounds.right - bounds.left, bounds.bottom - bounds.top,
+                 SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    for (const ChildPlacement& child : children) {
+        const RECT& rect = child.dialogRect;
+        SetWindowPos(child.hwnd, nullptr, rect.left - bounds.left, rect.top - bounds.top,
+                     rect.right - rect.left, rect.bottom - rect.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+static void layoutPageForms(EditorState& s)
+{
+    RECT tabRect{};
+    if (s.tab && GetWindowRect(s.tab, &tabRect))
+        MapWindowPoints(nullptr, s.hwnd, reinterpret_cast<POINT*>(&tabRect), 2);
+    RECT header{};
+    HWND sampleHeader = GetDlgItem(s.hwnd, ID_HEADER);
+    if (sampleHeader && GetWindowRect(sampleHeader, &header))
+        MapWindowPoints(nullptr, s.hwnd, reinterpret_cast<POINT*>(&header), 2);
+    RECT settingsPage{};
+    if (s.tab && GetClientRect(s.tab, &settingsPage)) {
+        // The input is the tab control's window client rectangle. Convert it
+        // to the page display area so the settings form cannot cover the tabs.
+        SendMessageW(s.tab, TCM_ADJUSTRECT, FALSE, reinterpret_cast<LPARAM>(&settingsPage));
+        MapWindowPoints(s.tab, s.hwnd, reinterpret_cast<POINT*>(&settingsPage), 2);
+    } else settingsPage = tabRect;
+    const LONG itemTop = header.top ? header.top + 12 : 50;
+    const LONG rightPaneLeft = header.left ? header.left + 8 : 151;
+    const LONG itemRight = header.right ? header.right - 6 : settingsPage.right;
+    const LONG itemBottom = header.bottom ? header.bottom - 12 : settingsPage.bottom;
+    const LONG pageRight = settingsPage.right ? settingsPage.right : itemRight;
+    const LONG pageBottom = settingsPage.bottom ? settingsPage.bottom : itemBottom;
+    RECT itemRegion{rightPaneLeft, itemTop,
+                    std::min(itemRight, pageRight), std::min(itemBottom, pageBottom)};
+    for (HWND form : {s.emptyForm, s.scriptForm, s.actionForm, s.executeForm,
+                      s.submenuForm, s.separatorForm}) layoutPageForm(s, form, itemRegion);
+    layoutPageForm(s, s.settingsForm, settingsPage);
+}
+
+static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    auto* s = reinterpret_cast<EditorState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_INITDIALOG) {
+        s = reinterpret_cast<EditorState*>(lParam);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(s));
+        s->hwnd = hwnd;
+        s->emptyForm = createPageForm(*s, IDD_ITEM_EMPTY);
+        s->scriptForm = createPageForm(*s, IDD_ITEM_SCRIPT);
+        s->actionForm = createPageForm(*s, IDD_ITEM_ACTION);
+        s->executeForm = createPageForm(*s, IDD_ITEM_EXECUTE);
+        s->submenuForm = createPageForm(*s, IDD_ITEM_SUBMENU);
+        s->separatorForm = createPageForm(*s, IDD_ITEM_SEPARATOR);
+        s->settingsForm = createPageForm(*s, IDD_PATHS_SETTINGS);
+        s->font = reinterpret_cast<HFONT>(SendMessageW(GetDlgItem(s->scriptForm, ID_TITLE), WM_GETFONT, 0, 0));
+        if (!s->font) s->font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        LOGFONTW placeholderFont{};
+        if (GetObjectW(s->font, sizeof(placeholderFont), &placeholderFont) == sizeof(placeholderFont)) {
+            placeholderFont.lfHeight = -12; placeholderFont.lfWeight = FW_NORMAL;
+            placeholderFont.lfItalic = FALSE; placeholderFont.lfUnderline = FALSE; placeholderFont.lfStrikeOut = FALSE;
+            s->shortcutPlaceholderFont = CreateFontIndirectW(&placeholderFont);
+        }
+        LOGFONTW clearFont{};
+        if (GetObjectW(s->font, sizeof(clearFont), &clearFont) == sizeof(clearFont)) {
+            clearFont.lfHeight = -22; clearFont.lfWeight = FW_NORMAL;
+            s->shortcutClearFont = CreateFontIndirectW(&clearFont);
+        }
+        SetWindowTextW(hwnd, tr(*s, "ConfigTitle").c_str());
+        s->controlParent = hwnd;
+        s->tab = control(*s, WC_TABCONTROLW, L"", WS_TABSTOP, 0, 0, 0, 0, ID_TAB);
+        if (s->tab) SetWindowPos(s->tab, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        TCITEMW tabItem{}; tabItem.mask = TCIF_TEXT;
+        std::wstring tabText = tr(*s, "ConfigTabMenus"); tabItem.pszText = const_cast<wchar_t*>(tabText.c_str());
+        SendMessageW(s->tab, TCM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&tabItem));
+        tabText = tr(*s, "ConfigTabSettings"); tabItem.pszText = const_cast<wchar_t*>(tabText.c_str());
+        SendMessageW(s->tab, TCM_INSERTITEMW, 1, reinterpret_cast<LPARAM>(&tabItem));
+        s->newButton = control(*s, L"BUTTON", tr(*s, "ConfigNew"), 0, 0, 0, 0, 0, ID_NEW);
+        s->deleteButton = control(*s, L"BUTTON", tr(*s, "ConfigDelete"), 0, 0, 0, 0, 0, ID_DELETE);
+        s->upButton = control(*s, L"BUTTON", tr(*s, "ConfigMoveUp"), 0, 0, 0, 0, 0, ID_UP);
+        s->downButton = control(*s, L"BUTTON", tr(*s, "ConfigMoveDown"), 0, 0, 0, 0, 0, ID_DOWN);
+        s->tree = control(*s, WC_TREEVIEWW, L"", 0, 0, 0, 0, 0, ID_TREE);
+        initializeTreeImages(*s);
+
+        auto registerItemForm = [&](HWND form, int id, const std::wstring& label = L"") {
+            s->controlParent = form;
+            control(*s, L"STATIC", label, 0, 0, 0, 0, 0, id);
+        };
+        auto registerHeader = [&](HWND form, const char* heading) {
+            registerItemForm(form, ID_HEADER, tr(*s, heading));
+            HWND header = GetDlgItem(form, ID_HEADER);
+            RECT rect{};
+            if (header && GetWindowRect(header, &rect))
+                SetWindowPos(header, nullptr, 0, 0, rect.right - rect.left,
+                             rect.bottom - rect.top + 1,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        };
+        registerHeader(hwnd, "ConfigItemSettings");
+        offsetControlY(GetDlgItem(hwnd, ID_HEADER), 2);
+        registerItemForm(s->emptyForm, ID_INFO);
+        registerItemForm(s->separatorForm, ID_INFO);
+        for (HWND form : {s->scriptForm, s->submenuForm, s->actionForm, s->executeForm}) {
+            registerItemForm(form, ID_TITLE_LABEL, tr(*s, "ConfigTitleLabel"));
+            registerItemForm(form, ID_TITLE);
+            registerItemForm(form, ID_SHORTCUT_LABEL, tr(*s, "ConfigShortcut"));
+            registerItemForm(form, ID_SHORTCUT);
+            if (form == s->scriptForm) {
+                registerItemForm(form, ID_SCRIPT_LABEL, tr(*s, "ConfigScriptFile"));
+                registerItemForm(form, ID_SCRIPT);
+                registerItemForm(form, ID_SCRIPT_BROWSE, tr(*s, "ConfigBrowse"));
+                registerItemForm(form, ID_SCRIPT_EDIT, tr(*s, "ConfigEditScript"));
+            } else if (form == s->actionForm) {
+                registerItemForm(form, ID_ACTION_LABEL, tr(*s, "ConfigAction"));
+                registerItemForm(form, ID_ACTION);
+                registerItemForm(form, ID_ACTION_TARGET_LABEL, tr(*s, "ConfigMenuPathOrId"));
+                registerItemForm(form, ID_ACTION_TARGET);
+                registerItemForm(form, ID_ACTION_HINT, tr(*s, "ConfigMenuPathHint"));
+                registerItemForm(form, ID_ACTION_HELP, tr(*s, "ConfigFindMenuIds"));
+            } else if (form == s->executeForm) {
+                registerItemForm(form, ID_COMMAND_LABEL, tr(*s, "ConfigCommand"));
+                registerItemForm(form, ID_COMMAND);
+                registerItemForm(form, ID_COMMAND_HELP);
+                registerItemForm(form, ID_SAVE_BEFORE_RUN, tr(*s, "ConfigSaveBeforeRun"));
+                registerItemForm(form, ID_RUN_IN_LABEL, tr(*s, "ConfigRunIn"));
+                registerItemForm(form, ID_RUN_IN);
+                registerItemForm(form, ID_CODE_PAGE_LABEL, tr(*s, "ConfigCodePage"));
+                registerItemForm(form, ID_CODE_PAGE);
+                registerItemForm(form, ID_ENV_LABEL, tr(*s, "ConfigEnvironment"));
+                registerItemForm(form, ID_ENV_LIST);
+                registerItemForm(form, ID_ENV_HELP);
+            }
+        }
+        s->shortcutHintText = tr(*s, "ConfigShortcutHint");
+        const std::wstring envPlaceholder = tr(*s, "ConfigEnvironmentPlaceholder");
+        SendMessageW(GetDlgItem(s->executeForm, ID_ENV_LIST), EM_SETCUEBANNER, TRUE,
+                     reinterpret_cast<LPARAM>(envPlaceholder.c_str()));
+
+        s->controlParent = s->settingsForm;
+        s->workspacePath = control(*s, L"EDIT", L"", 0, 0, 0, 0, 0, ID_WORKSPACE_PATH);
+        control(*s, L"STATIC", tr(*s, "ConfigWorkspaceFolder"), 0, 0, 0, 0, 0, ID_WORKSPACE_LABEL);
+        s->workspaceSet = control(*s, L"BUTTON", tr(*s, "ConfigSetFolder"), 0, 0, 0, 0, 0, ID_WORKSPACE_SET);
+        s->workspaceOpen = control(*s, L"BUTTON", tr(*s, "ConfigOpenFolder"), 0, 0, 0, 0, 0, ID_WORKSPACE_OPEN);
+        s->menuJsonPath = control(*s, L"EDIT", L"", 0, 0, 0, 0, 0, ID_MENU_JSON_PATH);
+        control(*s, L"STATIC", tr(*s, "ConfigMenuJsonPath"), 0, 0, 0, 0, 0, ID_MENU_JSON_LABEL);
+        s->menuJsonBrowse = control(*s, L"BUTTON", tr(*s, "ConfigSetFolder"), 0, 0, 0, 0, 0, ID_MENU_JSON_BROWSE);
+        s->menuJsonOpen = control(*s, L"BUTTON", tr(*s, "ConfigOpenFolder"), 0, 0, 0, 0, 0, ID_MENU_JSON_OPEN);
+        EnableWindow(s->menuJsonBrowse, FALSE);
+        s->scriptFolderPath = control(*s, L"EDIT", L"", 0, 0, 0, 0, 0, ID_SCRIPT_FOLDER_PATH);
+        control(*s, L"STATIC", tr(*s, "ConfigScriptFolder"), 0, 0, 0, 0, 0, ID_SCRIPT_FOLDER_LABEL);
+        s->scriptFolderSet = control(*s, L"BUTTON", tr(*s, "ConfigSetFolder"), 0, 0, 0, 0, 0, ID_SCRIPT_FOLDER_SET);
+        s->scriptFolderOpen = control(*s, L"BUTTON", tr(*s, "ConfigOpenFolder"), 0, 0, 0, 0, 0, ID_SCRIPT_FOLDER_OPEN);
+        s->iconFolderPath = control(*s, L"EDIT", L"", 0, 0, 0, 0, 0, ID_ICON_FOLDER_PATH);
+        control(*s, L"STATIC", tr(*s, "ConfigIconFolder"), 0, 0, 0, 0, 0, ID_ICON_FOLDER_LABEL);
+        s->iconFolderSet = control(*s, L"BUTTON", tr(*s, "ConfigSetFolder"), 0, 0, 0, 0, 0, ID_ICON_FOLDER_SET);
+        s->iconFolderOpen = control(*s, L"BUTTON", tr(*s, "ConfigOpenFolder"), 0, 0, 0, 0, 0, ID_ICON_FOLDER_OPEN);
+        s->pathsInfoGroup = control(*s, L"BUTTON", tr(*s, "ConfigPathsInfoTitle"), 0, 0, 0, 0, 0, ID_PATHS_INFO_GROUP);
+        s->pathsInfoText = control(*s, L"STATIC", tr(*s, "ConfigPathsInfoText"), 0, 0, 0, 0, 0, ID_PATHS_INFO_TEXT);
+        s->controlParent = hwnd;
+        s->saveButton = control(*s, L"BUTTON", L"", 0, 0, 0, 0, 0, ID_SAVE_REBUILD);
+        if (s->saveButton) SetWindowTextW(s->saveButton, escapeButtonMnemonics(tr(*s, "ConfigSaveRebuild")).c_str());
+        s->workspaceFolder = s->context.workspaceFolder;
+        refreshSettingsPaths(*s);
+
+        const int editIds[] = {ID_TITLE, ID_SHORTCUT, ID_SCRIPT, ID_ACTION_TARGET,
+                               ID_WORKSPACE_PATH, ID_MENU_JSON_PATH, ID_SCRIPT_FOLDER_PATH, ID_ICON_FOLDER_PATH};
+        const int multilineIds[] = {ID_COMMAND, ID_ENV_LIST};
+        for (HWND form : {s->emptyForm, s->scriptForm, s->actionForm, s->executeForm,
+                          s->submenuForm, s->separatorForm}) {
+            for (int id : editIds) applySingleLineEditInsets(GetDlgItem(form, id));
+            for (int id : multilineIds) applyMultilineEditInsets(GetDlgItem(form, id));
+            for (int id : {ID_TITLE_LABEL, ID_TITLE, ID_SHORTCUT_LABEL, ID_SHORTCUT, ID_ICON,
+                           ID_SCRIPT_LABEL, ID_SCRIPT, ID_SCRIPT_BROWSE, ID_SCRIPT_EDIT,
+                           ID_ACTION_LABEL, ID_ACTION, ID_ACTION_TARGET_LABEL, ID_ACTION_TARGET,
+                           ID_ACTION_HINT, ID_ACTION_HELP, ID_COMMAND_LABEL, ID_COMMAND, ID_COMMAND_HELP,
+                           ID_SAVE_BEFORE_RUN, ID_RUN_IN_LABEL, ID_RUN_IN, ID_CODE_PAGE_LABEL,
+                           ID_CODE_PAGE, ID_ENV_LABEL, ID_ENV_LIST, ID_ENV_HELP, ID_INFO})
+                offsetControlY(GetDlgItem(form, id), 2);
+        }
+        for (int id : {ID_WORKSPACE_PATH, ID_MENU_JSON_PATH, ID_SCRIPT_FOLDER_PATH, ID_ICON_FOLDER_PATH})
+            applySingleLineEditInsets(GetDlgItem(s->settingsForm, id));
+
+        s->controlParent = s->actionForm;
+        s->action = GetDlgItem(s->actionForm, ID_ACTION);
+        fillActionCombo(*s, L"RUN_CURRENT_FILE");
+        const wchar_t* codePages[] = {L"ANSI", L"UTF-8", L"UTF-16LE", L"UTF-16BE", L"UTF-32LE", L"UTF-32BE", L"US-ASCII", L"ISO-8859-1", L"UTF-7"};
+        s->codePage = GetDlgItem(s->executeForm, ID_CODE_PAGE);
+        for (const wchar_t* value : codePages) SendMessageW(s->codePage, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value));
+        s->runIn = GetDlgItem(s->executeForm, ID_RUN_IN);
+        fillRunIn(*s, L"output_pane");
+        s->controlParent = hwnd;
+        layoutPageForms(*s);
+        bindItemForm(*s, nullptr);
+        s->workspaceFolder = s->context.workspaceFolder;
+        refreshSettingsPaths(*s);
+        s->controlParent = s->executeForm;
+        s->commandLabel = GetDlgItem(s->executeForm, ID_COMMAND_LABEL);
+        s->command = GetDlgItem(s->executeForm, ID_COMMAND);
+        s->commandHelp = GetDlgItem(s->executeForm, ID_COMMAND_HELP);
+        s->envLabel = GetDlgItem(s->executeForm, ID_ENV_LABEL);
+        s->envList = GetDlgItem(s->executeForm, ID_ENV_LIST);
+        s->envHelp = GetDlgItem(s->executeForm, ID_ENV_HELP);
+        positionHelpLink(*s, s->commandLabel, s->command, s->commandHelp);
+        positionHelpLink(*s, s->envLabel, s->envList, s->envHelp);
+        s->controlParent = hwnd;
+        showEditorPage(*s, 0);
+        RECT dialogRect{}, ownerRect{};
+        if (GetWindowRect(hwnd, &dialogRect) && s->context.owner &&
+            GetWindowRect(s->context.owner, &ownerRect)) {
+            const int dialogWidth = dialogRect.right - dialogRect.left;
+            const int dialogHeight = dialogRect.bottom - dialogRect.top;
+            const int x = ownerRect.left + ((ownerRect.right - ownerRect.left) - dialogWidth) / 2;
+            const int y = ownerRect.top + ((ownerRect.bottom - ownerRect.top) - dialogHeight) / 2;
+            SetWindowPos(hwnd, nullptr, x, y, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        ShowWindow(hwnd, SW_SHOW);
+        SetFocus(s->tree);
+        rebuildTree(*s);
+        s->dirty = false;
+        return FALSE;
+    }
+    if (!s) return FALSE;
+    if (message == TITLE_REFRESH_MESSAGE) {
+        if (!s->selected) return TRUE;
+        if (commitSelected(*s)) refreshSelectedTreeItemTitle(*s);
+        return TRUE;
+    }
+    if (message == WM_DRAWITEM &&
+        drawHelpLink(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) return TRUE;
+    if (message == WM_DRAWITEM &&
+        drawComboItem(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) return TRUE;
+    if (message == WM_DRAWITEM && wParam == ID_ICON) {
+        auto* draw = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (draw && draw->CtlType == ODT_BUTTON) {
+            FillRect(draw->hDC, &draw->rcItem, GetSysColorBrush(COLOR_BTNFACE));
+            DrawEdge(draw->hDC, &draw->rcItem,
+                     (draw->itemState & ODS_SELECTED) ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
+            if (s->iconPreview) {
+                const int width = draw->rcItem.right - draw->rcItem.left;
+                const int height = draw->rcItem.bottom - draw->rcItem.top;
+                const int x = draw->rcItem.left + (width - 32) / 2;
+                const int y = draw->rcItem.top + (height - 32) / 2;
+                DrawIconEx(draw->hDC, x, y, s->iconPreview, 32, 32, 0, nullptr, DI_NORMAL);
+            }
+            if (draw->itemState & ODS_FOCUS) {
+                RECT focus = draw->rcItem;
+                InflateRect(&focus, -4, -4);
+                DrawFocusRect(draw->hDC, &focus);
+            }
+            return TRUE;
+        }
+    }
+    if (message == WM_NOTIFY && reinterpret_cast<NMHDR*>(lParam)->idFrom == ID_TAB && reinterpret_cast<NMHDR*>(lParam)->code == TCN_SELCHANGE) {
+        const int page = static_cast<int>(SendMessageW(s->tab, TCM_GETCURSEL, 0, 0));
+        if (s->activePage == 0 && page != 0 && !commitSelected(*s)) {
+            SendMessageW(s->tab, TCM_SETCURSEL, s->activePage, 0);
+            MessageBoxW(hwnd, tr(*s, "ConfigInvalidJson").c_str(),
+                        tr(*s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING);
+            return TRUE;
+        }
+        showEditorPage(*s, page);
+        return TRUE;
+    }
+    if (message == WM_NOTIFY && reinterpret_cast<NMHDR*>(lParam)->idFrom == ID_TREE &&
+        reinterpret_cast<NMHDR*>(lParam)->code == NM_RCLICK) {
+        POINT screen{};
+        if (GetCursorPos(&screen)) showTreeContextMenu(*s, screen);
+        return TRUE;
+    }
+    if (message == WM_NOTIFY && reinterpret_cast<NMHDR*>(lParam)->idFrom == ID_TREE &&
+        reinterpret_cast<NMHDR*>(lParam)->code == TVN_BEGINDRAGW) {
+        auto* drag = reinterpret_cast<NMTREEVIEWW*>(lParam);
+        beginTreeDrag(*s, drag->itemNew.hItem);
+        return TRUE;
+    }
+    if (message == WM_NOTIFY && reinterpret_cast<NMHDR*>(lParam)->idFrom == ID_TREE && reinterpret_cast<NMHDR*>(lParam)->code == TVN_SELCHANGEDW) {
+        if (s->rebuildingTree) return TRUE;
+        auto* change = reinterpret_cast<NMTREEVIEWW*>(lParam);
+        auto* node = reinterpret_cast<EditorNode*>(change->itemNew.lParam);
+        if (!commitSelected(*s)) { MessageBoxW(hwnd, tr(*s, "ConfigDuplicateMenuTitle").c_str(), tr(*s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING); return TRUE; }
+        loadSelected(*s, node);
+        return TRUE;
+    }
+    if (message == WM_MOUSEMOVE && s->draggingTreeItem) {
+        updateTreeDrag(*s);
+        return TRUE;
+    }
+    if (message == WM_LBUTTONUP && s->draggingTreeItem) {
+        endTreeDrag(*s, true);
+        return TRUE;
+    }
+    if (message == WM_CAPTURECHANGED && s->draggingTreeItem) {
+        s->draggingTreeItem = false;
+        clearTreeDropFeedback(*s);
+        s->dragItem = nullptr;
+        SetCursor(systemCursor(32512)); // IDC_ARROW
+        return TRUE;
+    }
+    if (message == WM_CANCELMODE && s->draggingTreeItem) {
+        endTreeDrag(*s, false);
+        return TRUE;
+    }
+    if (message == WM_TIMER && wParam == TITLE_REFRESH_TIMER) {
+        KillTimer(hwnd, TITLE_REFRESH_TIMER);
+        PostMessageW(hwnd, TITLE_REFRESH_MESSAGE, 0, 0);
+        return TRUE;
+    }
+    if (message == WM_TIMER && wParam == TREE_DRAG_EXPAND_TIMER) {
+        KillTimer(hwnd, TREE_DRAG_EXPAND_TIMER);
+        const HTREEITEM expandItem = s->pendingExpand;
+        s->pendingExpand = nullptr;
+        if (s->draggingTreeItem && expandItem && s->dragTarget == expandItem &&
+            s->dropPosition == DropPosition::Into) {
+            TreeView_Expand(s->tree, expandItem, TVE_EXPAND);
+            TreeView_SelectDropTarget(s->tree, expandItem);
+        }
+        return TRUE;
+    }
+    if (message == WM_COMMAND) {
+        const int id = LOWORD(wParam), notification = HIWORD(wParam);
+        if (id == ID_ACTION_HELP && notification == BN_CLICKED) {
+            ShellExecuteW(hwnd, L"open", L"https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/english.xml", nullptr, nullptr, SW_SHOWNORMAL);
+            return TRUE;
+        }
+        if ((id == ID_COMMAND_HELP || id == ID_ENV_HELP) && notification == BN_CLICKED) {
+            if (!s->context.placeholdersUrl.empty())
+                ShellExecuteW(hwnd, L"open", s->context.placeholdersUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return TRUE;
+        }
+        if (id == ID_ACTION && notification == CBN_SELCHANGE) {
+            const int kind = static_cast<int>(SendMessageW(s->action, CB_GETITEMDATA, SendMessageW(s->action, CB_GETCURSEL, 0, 0), 0));
+            showActionTargetControls(*s, kind == 3); s->dirty = true; return TRUE;
+        }
+        onCommand(*s, id, notification);
+        return TRUE;
+    }
+    if (message == WM_CLOSE) { onCommand(*s, ID_CANCEL, BN_CLICKED); return TRUE; }
+    if (message == WM_DESTROY) {
+        if (s->shortcutPlaceholderFont) { DeleteObject(s->shortcutPlaceholderFont); s->shortcutPlaceholderFont = nullptr; }
+        if (s->shortcutClearFont) { DeleteObject(s->shortcutClearFont); s->shortcutClearFont = nullptr; }
+        if (s->customIcon) { DestroyIcon(s->customIcon); s->customIcon = nullptr; }
+        if (s->treeImages) {
+            TreeView_SetImageList(s->tree, nullptr, TVSIL_NORMAL);
+            ImageList_Destroy(s->treeImages);
+            s->treeImages = nullptr;
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static cJSON* loadJson(const std::wstring& path)
+{
+    std::ifstream file(path.c_str(), std::ios::binary);
+    if (!file) return nullptr;
+    std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (bytes.size() >= 3 && static_cast<unsigned char>(bytes[0]) == 0xEF &&
+        static_cast<unsigned char>(bytes[1]) == 0xBB && static_cast<unsigned char>(bytes[2]) == 0xBF) bytes.erase(0, 3);
+    return bytes.empty() ? nullptr : cJSON_Parse(bytes.c_str());
+}
+
+} // namespace
+
+MenuConfigEditorResult showMenuConfigEditor(const MenuConfigEditorContext& context)
+{
+    EditorState state;
+    state.context = context;
+    state.iconFolder = context.iconFolder;
+    state.scriptFolder = context.scriptFolder;
+    state.root = loadJson(context.menuPath);
+    if (!cJSON_IsObject(state.root)) {
+        if (state.root) cJSON_Delete(state.root);
+        MessageBoxW(context.owner, context.translate ? context.translate("ConfigInvalidJson").c_str() : L"menu.json could not be opened.",
+                    context.translate ? context.translate("ConfigTitle").c_str() : L"NppMenuScripts", MB_OK | MB_ICONERROR);
+        return MenuConfigEditorResult::Closed;
+    }
+    state.menu = member(state.root, "menu");
+    state.toolbar = member(state.root, "toolbar");
+    if (!cJSON_IsObject(state.menu)) {
+        cJSON_Delete(state.root);
+        MessageBoxW(context.owner, context.translate ? context.translate("ConfigInvalidJson").c_str() : L"menu.json is invalid.",
+                    context.translate ? context.translate("ConfigTitle").c_str() : L"NppMenuScripts", MB_OK | MB_ICONERROR);
+        return MenuConfigEditorResult::Closed;
+    }
+    for (cJSON* group = state.menu->child; group; group = group->next) {
+        if (!cJSON_IsArray(group)) {
+            cJSON_Delete(state.root);
+            MessageBoxW(context.owner, context.translate ? context.translate("ConfigInvalidJson").c_str() : L"menu.json is invalid.",
+                        context.translate ? context.translate("ConfigTitle").c_str() : L"NppMenuScripts", MB_OK | MB_ICONERROR);
+            return MenuConfigEditorResult::Closed;
+        }
+    }
+
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_TAB_CLASSES | ICC_TREEVIEW_CLASSES};
+    if (!InitCommonControlsEx(&controls)) {
+        cJSON_Delete(state.root);
+        MessageBoxW(context.owner, L"Unable to initialize the menu configuration controls.", L"NppMenuScripts", MB_OK | MB_ICONERROR);
+        return MenuConfigEditorResult::Closed;
+    }
+    const int result = DialogBoxParamW(context.module, MAKEINTRESOURCEW(IDD_MENU_CONFIG), context.owner,
+                                       dialogProc, reinterpret_cast<LPARAM>(&state));
+    cJSON_Delete(state.root);
+    if (result == CONFIG_EDITOR_WORKSPACE_CHANGED_RESULT) return MenuConfigEditorResult::WorkspaceChanged;
+    return MenuConfigEditorResult::Closed;
+}
+

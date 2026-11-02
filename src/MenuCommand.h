@@ -8,11 +8,13 @@ enum class MenuCommandAction {
     RunCommand,
     RunCurrentFile,
     StopScript,
+    ConfigureMenu,
     RunMenuCommand
 };
 
 constexpr std::wstring_view RUN_CURRENT_FILE_ACTION = L"RUN_CURRENT_FILE";
 constexpr std::wstring_view STOP_SCRIPT_ACTION = L"STOP_SCRIPT";
+constexpr std::wstring_view CONFIGURE_MENU_ACTION = L"CONFIGURE_MENU";
 
 constexpr bool hasExactlyOneExecutionTarget(bool hasScript, bool hasAction)
 {
@@ -34,6 +36,10 @@ inline bool parseActionToken(std::wstring_view value, MenuCommandAction& action,
     }
     if (value == STOP_SCRIPT_ACTION) {
         action = MenuCommandAction::StopScript;
+        return true;
+    }
+    if (value == CONFIGURE_MENU_ACTION) {
+        action = MenuCommandAction::ConfigureMenu;
         return true;
     }
     constexpr std::wstring_view menuPrefix = L"MENU:";

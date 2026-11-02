@@ -33,6 +33,7 @@
 #include "version.h"
 #include "ScriptExitState.h"
 #include "MenuCommand.h"
+#include "MenuConfigEditor.h"
 extern "C" {
 #include "../third_party/cJSON.h"
 }
@@ -46,10 +47,12 @@ static NppData g_nppData{};
 static HMODULE g_hModule = nullptr;
 
 static void showAbout();
-static void openScriptsFolder();
+static void runCurrentFile();
 static void openMenuJson();
+static void configureMenu();
 static void rebuildMenu();
-static void setWorkspaceFolder();
+static bool chooseWorkspaceFolder(HWND owner);
+static bool openOrCreateScript(const std::wstring& scriptPath, HWND promptOwner = nullptr);
 static void stopScript();
 static bool installMenus(const std::wstring& jsonPath, bool forceRebuild = false);
 static void removeMenus();
@@ -79,11 +82,14 @@ struct ExecuteOptions {
             codePage == other.codePage && runIn == other.runIn && environment == other.environment;
     }
 };
+static bool parseExecuteOptions(cJSON* item, ExecuteOptions& options);
+static bool validMenuItems(cJSON* items, unsigned int depth);
+static std::wstring scriptExtension(const std::wstring& path);
+static constexpr size_t MAX_TOOLBAR_ITEMS = 32;
 static FuncItem g_funcItems[] = {
-    { L"Open Scripts Folder", openScriptsFolder, 0, false, nullptr },
-    { L"Open menu.json", openMenuJson, 0, false, nullptr },
+    { L"Configure Menu...", configureMenu, 0, false, nullptr },
     { L"Rebuild Menu && Toolbar", rebuildMenu, 0, false, nullptr },
-    { L"Set Workspace Folder...", setWorkspaceFolder, 0, false, nullptr },
+    { L"Run Current File", runCurrentFile, 0, false, nullptr },
     { L"Stop Script", stopScript, 0, false, nullptr },
     { L"", nullptr, 0, false, nullptr },
     { L"", showAbout, 0, false, nullptr }
@@ -283,6 +289,48 @@ static const std::wstring& tr(const char* key)
     static const std::wstring empty;
     static const std::unordered_map<std::string, std::wstring> builtInEnglish = {
         {"OutputPane", L"Output Pane"}, {"OpenScriptsFolder", L"Open Scripts Folder"},
+        {"ConfigTitle", L"NppMenuScripts - Menu Configuration"}, {"ConfigureMenu", L"Configure Menu..."},
+        {"ConfigMenuRoot", L"Menu"},
+        {"ConfigToolbarRoot", L"Toolbar"}, {"ConfigNew", L"New"}, {"ConfigDelete", L"Delete"},
+        {"ConfigMoveUp", L"Up"}, {"ConfigMoveDown", L"Down"},
+        {"ConfigSaveRebuild", L"Save & Rebuild"}, {"ConfigCancel", L"Cancel"}, {"ConfigTitleLabel", L"Title"},
+        {"ConfigChangeIcon", L"Change icon..."}, {"ConfigScriptSettings", L"Script Settings"},
+        {"ConfigExecuteSettings", L"Execute Settings"}, {"ConfigActionSettings", L"Action Settings"},
+        {"ConfigSubmenuSettings", L"Submenu Settings"}, {"ConfigItemSettings", L"Item Settings"},
+        {"ConfigScriptFile", L"Script file"}, {"ConfigBrowse", L"Browse..."}, {"ConfigEditScript", L"Edit"},
+        {"ConfigScriptFileMissing", L"The selected script file does not exist."}, {"ConfigAction", L"Action"},
+        {"ConfigMenuPathOrId", L"Menu path or Item ID"},
+        {"ConfigMenuPathHint", L"Enter an Item ID or a menu path in the current UI language."},
+        {"ConfigFindMenuIds", L"Find menu IDs"}, {"ConfigCommand", L"Command"},
+        {"ConfigSaveBeforeRun", L"Save current file before running"}, {"ConfigRunIn", L"Run in"},
+        {"ConfigCodePage", L"Code page"}, {"ConfigEnvironment", L"Environment variables"},
+        {"ConfigAddOrUpdate", L"Add / Update"}, {"ConfigRemove", L"Remove"}, {"ConfigSeparator", L"Separator"},
+        {"ConfigSubmenu", L"Submenu"}, {"ConfigScript", L"Script"}, {"ConfigExecute", L"Execute"},
+        {"ConfigRunCurrentFile", L"Run Current File"}, {"ConfigStopScript", L"Stop Script"},
+        {"ConfigRunMenuCommand", L"Run Menu Command"}, {"ConfigOpenMenuConfig", L"Open Menu Configuration"},
+        {"ConfigShortcut", L"Shortcut"}, {"ConfigInvalidShortcut", L"Use Ctrl, Alt, or Shift with a letter, number, or function key."},
+        {"ConfigShortcutHint", L"Focus this field and press a shortcut combination. Press Esc to clear it."},
+        {"ConfigEnvironmentPlaceholder", L"# One NAME=value per line\r\nNMS_EXAMPLE={FILE_NAME}\r\nNMS_TEXT={SELECT_TEXT}"},
+        {"ConfigConsole", L"Windows Terminal"}, {"ConfigWindows", L"Windows"},
+        {"ConfigSelectToolbar", L"Select Toolbar to add items."},
+        {"ConfigSelectMenu", L"Select a menu or submenu to add items."},
+        {"ConfigSeparatorInfo", L"A separator has no settings."},
+        {"ConfigDuplicateMenuTitle", L"Menu titles must be unique."},
+        {"ConfigInvalidJson", L"menu.json has an invalid or unsupported structure."},
+        {"ConfigIconMissing", L"The toolbar icon is missing or invalid. Choose another icon or use the default icon. Changes were not saved."},
+        {"ConfigSaveFailed", L"Unable to save menu.json."}, {"ConfigChooseIcon", L"Choose icon file..."},
+        {"ConfigRebuildFailed", L"menu.json was saved, but the menu could not be rebuilt. Fix the configuration and rebuild again."},
+        {"ConfigNewMenuDefault", L"New Menu"}, {"ConfigNewSubmenuDefault", L"New Submenu"},
+        {"ConfigNewItemDefault", L"New Item"},
+        {"ConfigTabMenus", L"Menus / Toolbar"}, {"ConfigTabSettings", L"Paths"},
+        {"ConfigWorkspaceFolder", L"Workspace folder:"}, {"ConfigMenuJsonPath", L"Menu file:"},
+        {"ConfigScriptFolder", L"Scripts folder:"},
+        {"ConfigIconFolder", L"Icons folder:"}, {"ConfigSetFolder", L"Set..."},
+        {"ConfigOpenFolder", L"Open"}, {"ConfigSelectScriptFolder", L"Select scripts folder"},
+        {"ConfigSelectIconFolder", L"Select icons folder"}, {"ConfigFolderMissing", L"The selected folder does not exist."},
+        {"ConfigFolderOpenFailed", L"Unable to open the selected folder."},
+        {"ConfigUseDefaultIcon", L"Use default icon"}, {"ConfigDeleteConfirm", L"Delete the selected item and its children?"},
+        {"ConfigUnsavedPrompt", L"Save changes before closing? Yes saves and rebuilds, No discards changes."},
         {"OpenMenuJson", L"Open menu.json"}, {"RebuildMenuToolbar", L"Rebuild Menu && Toolbar"},
         {"SetWorkspaceFolder", L"Set Workspace Folder..."},
         {"About", L"About NppMenuScripts (v{version})"},
@@ -435,11 +483,11 @@ static bool setMenuLabelByCommand(HMENU menu, UINT commandId, const wchar_t* lab
 
 static void applyTranslatedPluginMenu()
 {
-    const char* keys[] = { "OpenScriptsFolder", "OpenMenuJson", "RebuildMenuToolbar", "SetWorkspaceFolder", "StopScript", "", "About" };
+    const char* keys[] = { "ConfigureMenu", "RebuildMenuToolbar", "ConfigRunCurrentFile", "StopScript", "", "About" };
     for (size_t i = 0; i < std::size(keys); ++i) {
         if (!keys[i][0]) continue;
         std::wstring label = tr(keys[i]);
-        if (i == 6) {
+        if (i == 5) {
             const std::wstring version = std::to_wstring(NPP_MENUSCRIPTS_VERSION_MAJOR) + L"." +
                 std::to_wstring(NPP_MENUSCRIPTS_VERSION_MINOR) + L"." + std::to_wstring(NPP_MENUSCRIPTS_VERSION_PATCH) + L"." +
                 std::to_wstring(NPP_MENUSCRIPTS_VERSION_BUILD);
@@ -573,6 +621,8 @@ static std::wstring joinPath(std::wstring base, std::wstring name)
 {
     std::replace(base.begin(), base.end(), L'/', L'\\');
     std::replace(name.begin(), name.end(), L'/', L'\\');
+    if ((name.size() >= 3 && name[1] == L':' && name[2] == L'\\') ||
+        (name.size() >= 2 && name[0] == L'\\' && name[1] == L'\\')) return name;
     if (base.empty()) return name;
     if (base.back() == L'\\') return base + name;
     return base + L"\\" + name;
@@ -813,6 +863,21 @@ static std::wstring trim(const std::wstring& s)
     return s.substr(first, last - first + 1);
 }
 
+static std::wstring titleWithoutShortcut(const std::wstring& title)
+{
+    const size_t tab = title.find(L'\t');
+    return tab == std::wstring::npos ? title : title.substr(0, tab);
+}
+
+static std::wstring toolbarTooltip(const std::wstring& title)
+{
+    const size_t tab = title.find(L'\t');
+    if (tab == std::wstring::npos) return title;
+    const std::wstring shortcut = trim(title.substr(tab + 1));
+    return shortcut.empty() ? title.substr(0, tab) :
+        title.substr(0, tab) + L" (" + shortcut + L")";
+}
+
 static bool parseHotkey(const std::wstring& title, UINT& modifiers, UINT& key)
 {
     const size_t tab = title.find(L'\t');
@@ -978,46 +1043,6 @@ static void destroyHotkeyWindow()
     UnregisterClassW(HOTKEY_CLASS_NAME, g_hModule);
 }
 
-static void openScriptsFolder()
-{
-    if (g_processRunning.load()) {
-        MessageBoxW(g_nppData._nppHandle,
-                    tr("PleaseWait").c_str(),
-                    (std::wstring(L"NppMenuScripts - ") + tr("OpenScriptsFolder")).c_str(), MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-
-    const std::wstring folder = g_scriptFolder.empty()
-        ? resolveScriptFolder(workspaceMenuPath(), L"./script")
-        : g_scriptFolder;
-    if (folder.empty()) return;
-
-    const DWORD attrs = GetFileAttributesW(folder.c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-        const int answer = MessageBoxW(
-            g_nppData._nppHandle,
-            tr("ScriptsFolderMissing").c_str(),
-            (std::wstring(L"NppMenuScripts - ") + tr("OpenScriptsFolder")).c_str(),
-            MB_YESNO | MB_ICONQUESTION);
-        if (answer != IDYES) return;
-        const int result = SHCreateDirectoryExW(g_nppData._nppHandle, folder.c_str(), nullptr);
-        if (result != ERROR_SUCCESS && result != ERROR_FILE_EXISTS && result != ERROR_ALREADY_EXISTS) {
-            MessageBoxW(g_nppData._nppHandle,
-                        tr("CreateScriptsFolderFailed").c_str(),
-                        (std::wstring(L"NppMenuScripts - ") + tr("OpenScriptsFolder")).c_str(), MB_OK | MB_ICONERROR);
-            return;
-        }
-    }
-
-    const HINSTANCE result = ShellExecuteW(
-        g_nppData._nppHandle, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    if (reinterpret_cast<INT_PTR>(result) <= 32) {
-        MessageBoxW(g_nppData._nppHandle,
-                    tr("OpenScriptsFolderFailed").c_str(),
-                    (std::wstring(L"NppMenuScripts - ") + tr("OpenScriptsFolder")).c_str(), MB_OK | MB_ICONWARNING);
-    }
-}
-
 static void openMenuJson()
 {
     const std::wstring path = workspaceMenuPath();
@@ -1039,48 +1064,48 @@ static int CALLBACK workspaceFolderBrowseCallback(HWND hwnd, UINT message, LPARA
     return 0;
 }
 
-static void setWorkspaceFolder()
+static bool chooseWorkspaceFolder(HWND owner)
 {
     if (g_processRunning.load()) {
-        MessageBoxW(g_nppData._nppHandle, tr("PleaseWaitSetWorkspacePath").c_str(),
+        MessageBoxW(owner, tr("PleaseWaitSetWorkspacePath").c_str(),
                     (std::wstring(L"NppMenuScripts - ") + tr("SetWorkspaceFolder")).c_str(), MB_OK | MB_ICONINFORMATION);
-        return;
+        return false;
     }
 
     const std::wstring oldWorkspace = g_workspaceFolder.empty() ? loadConfiguredWorkspacePath() : g_workspaceFolder;
     BROWSEINFOW browse{};
-    browse.hwndOwner = g_nppData._nppHandle;
+    browse.hwndOwner = owner;
     browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
     const std::wstring dialogTitle = tr("SelectWorkspaceFolder");
     browse.lpszTitle = dialogTitle.c_str();
     browse.lpfn = workspaceFolderBrowseCallback;
     browse.lParam = reinterpret_cast<LPARAM>(oldWorkspace.c_str());
     PIDLIST_ABSOLUTE selectedItem = SHBrowseForFolderW(&browse);
-    if (!selectedItem) return;
+    if (!selectedItem) return false;
 
     wchar_t selectedPath[MAX_PATH * 4] = {};
     const bool gotPath = SHGetPathFromIDListW(selectedItem, selectedPath) != FALSE;
     CoTaskMemFree(selectedItem);
-    if (!gotPath) return;
+    if (!gotPath) return false;
 
     const std::wstring selected = fullPath(selectedPath);
-    if (selected.empty() || _wcsicmp(selected.c_str(), oldWorkspace.c_str()) == 0) return;
+    if (selected.empty() || _wcsicmp(selected.c_str(), oldWorkspace.c_str()) == 0) return false;
     if (isPathWithinDirectory(moduleDirectory(), selected)) {
-        MessageBoxW(g_nppData._nppHandle, tr("WorkspaceInsidePluginFolder").c_str(),
+        MessageBoxW(owner, tr("WorkspaceInsidePluginFolder").c_str(),
                     (std::wstring(L"NppMenuScripts - ") + tr("SetWorkspaceFolder")).c_str(), MB_OK | MB_ICONWARNING);
-        return;
+        return false;
     }
     if (!initializeWorkspaceContents(selected)) {
-        MessageBoxW(g_nppData._nppHandle, tr("WorkspaceInitFailed").c_str(),
+        MessageBoxW(owner, tr("WorkspaceInitFailed").c_str(),
                     (std::wstring(L"NppMenuScripts - ") + tr("SetWorkspaceFolder")).c_str(), MB_OK | MB_ICONERROR);
-        return;
+        return false;
     }
 
     const std::wstring newMenuPath = joinPath(selected, L"menu.json");
     if (!saveConfiguredWorkspacePath(selected)) {
-        MessageBoxW(g_nppData._nppHandle, tr("WorkspacePathSaveFailed").c_str(),
+        MessageBoxW(owner, tr("WorkspacePathSaveFailed").c_str(),
                     (std::wstring(L"NppMenuScripts - ") + tr("SetWorkspaceFolder")).c_str(), MB_OK | MB_ICONWARNING);
-        return;
+        return false;
     }
     removeMenus();
     g_workspaceFolder = selected;
@@ -1089,9 +1114,10 @@ static void setWorkspaceFolder()
         g_workspaceFolder = oldWorkspace;
         saveConfiguredWorkspacePath(oldWorkspace);
         installMenus(joinPath(oldWorkspace, L"menu.json"));
-        return;
+        return false;
     }
     setNppStatusText(trFormat("WorkspacePathSet", {{L"{path}", g_workspaceFolder}}));
+    return true;
 }
 
 static void rebuildMenu()
@@ -1114,6 +1140,114 @@ static void rebuildMenu()
             setNppStatusText(tr("ToolbarRestartRequired"));
         else
             setNppStatusText(trFormat("MenuRebuilt", {{L"{path}", g_menuJsonPath}}));
+    }
+}
+
+static bool saveAndRebuildFromEditor(std::wstring& error)
+{
+    const std::wstring path = workspaceMenuPath();
+    if (path.empty()) {
+        error = tr("ConfigRebuildFailed");
+        return false;
+    }
+    // installMenus() displays its own detailed error when it fails.
+    if (!installMenus(path, true)) return false;
+    if (g_toolbarRestartRequired) setNppStatusText(tr("ToolbarRestartRequired"));
+    else setNppStatusText(trFormat("MenuRebuilt", {{L"{path}", g_menuJsonPath}}));
+    return true;
+}
+
+static void configureMenu()
+{
+    if (g_processRunning.load()) {
+        MessageBoxW(g_nppData._nppHandle, tr("PleaseWait").c_str(),
+                    tr("ConfigTitle").c_str(), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    MenuConfigEditorContext context;
+    context.owner = g_nppData._nppHandle;
+    context.module = g_hModule;
+    context.translate = [](const char* key) { return tr(key); };
+    const std::wstring locale = nativeLocaleCode();
+    context.placeholdersUrl = (locale == L"zh-TW" || locale == L"zh-CN")
+        ? L"https://github.com/seantw/NppMenuScripts/blob/main/README.zh-TW.md#command-env-placeholders"
+        : L"https://github.com/seantw/NppMenuScripts/blob/main/README.md#command-env-placeholders";
+    context.chooseWorkspaceFolder = chooseWorkspaceFolder;
+    context.openOrCreateScript = [](HWND owner, const std::wstring& path) { return openOrCreateScript(path, owner); };
+    context.validate = [](cJSON* root, std::wstring& error) {
+        cJSON* scriptFolder = cJSON_GetObjectItemCaseSensitive(root, "script_folder");
+        cJSON* menu = cJSON_GetObjectItemCaseSensitive(root, "menu");
+        cJSON* debug = cJSON_GetObjectItemCaseSensitive(root, "debug");
+        cJSON* iconFolder = cJSON_GetObjectItemCaseSensitive(root, "icon_folder");
+        cJSON* hiddenMenus = cJSON_GetObjectItemCaseSensitive(root, "hide_main_menus");
+        if (!cJSON_IsString(scriptFolder) || !cJSON_IsObject(menu) ||
+            (debug && !cJSON_IsBool(debug)) || (iconFolder && !cJSON_IsString(iconFolder)) ||
+            (hiddenMenus && !cJSON_IsArray(hiddenMenus))) {
+            error = tr("InvalidMenuJson");
+            return false;
+        }
+        for (cJSON* hidden = hiddenMenus ? hiddenMenus->child : nullptr; hidden; hidden = hidden->next) {
+            if (!cJSON_IsString(hidden)) { error = tr("InvalidMenuJson"); return false; }
+        }
+        for (cJSON* group = menu->child; group; group = group->next) {
+            if (!cJSON_IsArray(group) || !validMenuItems(group, 0)) {
+                error = tr("InvalidMenuJson");
+                return false;
+            }
+        }
+        cJSON* toolbar = cJSON_GetObjectItemCaseSensitive(root, "toolbar");
+        if (toolbar && !cJSON_IsArray(toolbar)) {
+            error = tr("InvalidToolbarEntry");
+            return false;
+        }
+        if (toolbar && cJSON_GetArraySize(toolbar) > MAX_TOOLBAR_ITEMS) {
+            error = tr("ToolbarLimit");
+            return false;
+        }
+        for (cJSON* item = toolbar ? toolbar->child : nullptr; item; item = item->next) {
+            if (!cJSON_IsObject(item)) { error = tr("InvalidToolbarEntry"); return false; }
+            cJSON* title = cJSON_GetObjectItemCaseSensitive(item, "title");
+            cJSON* script = cJSON_GetObjectItemCaseSensitive(item, "script");
+            cJSON* action = cJSON_GetObjectItemCaseSensitive(item, "action");
+            cJSON* execute = cJSON_GetObjectItemCaseSensitive(item, "execute");
+            if (!cJSON_IsString(title) || !title->valuestring || !title->valuestring[0] ||
+                !hasExactlyOneExecutionTarget(script != nullptr, action != nullptr, execute != nullptr)) {
+                error = tr("InvalidToolbarEntry");
+                return false;
+            }
+            if (script && (!cJSON_IsString(script) || !hasScriptExtension(utf8ToWide(script->valuestring)))) {
+                error = tr("InvalidToolbarEntry");
+                return false;
+            }
+            if (action) {
+                MenuCommandAction parsed{};
+                std::wstring target;
+                if (!cJSON_IsString(action) || !parseActionToken(utf8ToWide(action->valuestring), parsed, target)) {
+                    error = tr("InvalidToolbarEntry");
+                    return false;
+                }
+            }
+            if (execute) {
+                ExecuteOptions options;
+                if (!parseExecuteOptions(execute, options)) { error = tr("InvalidToolbarEntry"); return false; }
+            }
+        }
+        return true;
+    };
+    context.saveAndRebuild = saveAndRebuildFromEditor;
+    for (;;) {
+        context.menuPath = workspaceMenuPath();
+        context.workspaceFolder = g_workspaceFolder;
+        context.scriptFolder = g_scriptFolder;
+        context.iconFolder = g_iconFolder;
+        if (context.menuPath.empty() || GetFileAttributesW(context.menuPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            MessageBoxW(g_nppData._nppHandle, tr("MenuJsonMissing").c_str(),
+                        tr("ConfigTitle").c_str(), MB_OK | MB_ICONERROR);
+            return;
+        }
+        const MenuConfigEditorResult result = showMenuConfigEditor(context);
+        if (result == MenuConfigEditorResult::WorkspaceChanged) continue;
+        return;
     }
 }
 
@@ -4207,8 +4341,9 @@ static bool createScriptTemplate(const std::wstring& scriptPath)
     return f.good();
 }
 
-static bool openOrCreateScript(const std::wstring& scriptPath)
+static bool openOrCreateScript(const std::wstring& scriptPath, HWND promptOwner)
 {
+    const HWND owner = promptOwner ? promptOwner : g_nppData._nppHandle;
     const DWORD attrs = GetFileAttributesW(scriptPath.c_str());
     if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
         SendMessageW(g_nppData._nppHandle, NPPM_DOOPEN, 0,
@@ -4216,15 +4351,22 @@ static bool openOrCreateScript(const std::wstring& scriptPath)
         return true;
     }
 
+    if (!hasScriptExtension(scriptPath)) {
+        const std::wstring message = trFormat("CurrentFileUnsupported", {
+            {L"{extension}", scriptExtension(scriptPath)}});
+        MessageBoxW(owner, message.c_str(), L"NppMenuScripts", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+
     const std::wstring fileName = scriptPath.substr(scriptPath.find_last_of(L"\\/") + 1);
     const std::wstring message = trFormat("CreateScriptPrompt", {{L"{name}", fileName}});
-    if (MessageBoxW(g_nppData._nppHandle, message.c_str(),
+    if (MessageBoxW(owner, message.c_str(),
                     L"NppMenuScripts", MB_YESNO | MB_ICONQUESTION) != IDYES) {
         return false;
     }
 
     if (!createScriptTemplate(scriptPath)) {
-        MessageBoxW(g_nppData._nppHandle,
+        MessageBoxW(owner,
                     tr("CreateScriptFailed").c_str(),
                     L"NppMenuScripts", MB_OK | MB_ICONERROR);
         return false;
@@ -4235,6 +4377,52 @@ static bool openOrCreateScript(const std::wstring& scriptPath)
     return true;
 }
 
+static bool prepareCurrentFileScript(std::wstring& scriptPath)
+{
+    scriptPath = getCurrentFilePath();
+    if (scriptPath.empty()) {
+        MessageBoxW(g_nppData._nppHandle, tr("CurrentFileUnnamed").c_str(),
+                    L"NppMenuScripts", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    if (!hasScriptExtension(scriptPath)) {
+        const std::wstring message = trFormat("CurrentFileUnsupported", {
+            {L"{extension}", scriptExtension(scriptPath)}});
+        MessageBoxW(g_nppData._nppHandle, message.c_str(), L"NppMenuScripts", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    HWND sci = currentScintilla();
+    if (sci && SendMessageW(sci, SCI_GETMODIFY_LOCAL, 0, 0) != 0) {
+        const int answer = MessageBoxW(g_nppData._nppHandle,
+            tr("CurrentFileModified").c_str(), L"NppMenuScripts",
+            MB_YESNO | MB_ICONQUESTION);
+        if (answer != IDYES) return false;
+        SendMessageW(g_nppData._nppHandle, NPPM_SAVECURRENTFILE, 0, 0);
+        if (SendMessageW(sci, SCI_GETMODIFY_LOCAL, 0, 0) != 0) {
+            MessageBoxW(g_nppData._nppHandle, tr("CurrentFileSaveFailed").c_str(),
+                        L"NppMenuScripts", MB_OK | MB_ICONWARNING);
+            return false;
+        }
+        // Save As may change the active document's path.
+        scriptPath = getCurrentFilePath();
+        if (scriptPath.empty() || !hasScriptExtension(scriptPath)) {
+            const std::wstring message = scriptPath.empty()
+                ? tr("CurrentFileUnnamed")
+                : trFormat("CurrentFileUnsupported", {{L"{extension}", scriptExtension(scriptPath)}});
+            MessageBoxW(g_nppData._nppHandle, message.c_str(), L"NppMenuScripts", MB_OK | MB_ICONWARNING);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void runCurrentFile()
+{
+    std::wstring scriptPath;
+    if (!prepareCurrentFileScript(scriptPath)) return;
+    runNodeScript(scriptPath, fileNameFromPath(scriptPath));
+}
+
 static void showScriptPath(int id, bool checkCtrlClick = true)
 {
     const int index = id - g_cmdBase;
@@ -4243,6 +4431,10 @@ static void showScriptPath(int id, bool checkCtrlClick = true)
     const MenuCommandAction action = g_scriptActions[static_cast<size_t>(index)];
     if (action == MenuCommandAction::StopScript) {
         stopScript();
+        return;
+    }
+    if (action == MenuCommandAction::ConfigureMenu) {
+        configureMenu();
         return;
     }
 
@@ -4272,42 +4464,7 @@ static void showScriptPath(int id, bool checkCtrlClick = true)
     std::wstring scriptPath = g_scriptPaths[static_cast<size_t>(index)];
     const bool currentFile = action == MenuCommandAction::RunCurrentFile;
 
-    if (currentFile) {
-        scriptPath = getCurrentFilePath();
-        if (scriptPath.empty()) {
-            MessageBoxW(g_nppData._nppHandle, tr("CurrentFileUnnamed").c_str(),
-                        L"NppMenuScripts", MB_OK | MB_ICONWARNING);
-            return;
-        }
-        if (!hasScriptExtension(scriptPath)) {
-            const std::wstring message = trFormat("CurrentFileUnsupported", {
-                {L"{extension}", scriptExtension(scriptPath)}});
-            MessageBoxW(g_nppData._nppHandle, message.c_str(), L"NppMenuScripts", MB_OK | MB_ICONWARNING);
-            return;
-        }
-        HWND sci = currentScintilla();
-        if (sci && SendMessageW(sci, SCI_GETMODIFY_LOCAL, 0, 0) != 0) {
-            const int answer = MessageBoxW(g_nppData._nppHandle,
-                tr("CurrentFileModified").c_str(), L"NppMenuScripts",
-                MB_YESNO | MB_ICONQUESTION);
-            if (answer != IDYES) return;
-            SendMessageW(g_nppData._nppHandle, NPPM_SAVECURRENTFILE, 0, 0);
-            if (SendMessageW(sci, SCI_GETMODIFY_LOCAL, 0, 0) != 0) {
-                MessageBoxW(g_nppData._nppHandle, tr("CurrentFileSaveFailed").c_str(),
-                            L"NppMenuScripts", MB_OK | MB_ICONWARNING);
-                return;
-            }
-            // Save As may change the active document's path.
-            scriptPath = getCurrentFilePath();
-            if (scriptPath.empty() || !hasScriptExtension(scriptPath)) {
-                const std::wstring message = scriptPath.empty()
-                    ? tr("CurrentFileUnnamed")
-                    : trFormat("CurrentFileUnsupported", {{L"{extension}", scriptExtension(scriptPath)}});
-                MessageBoxW(g_nppData._nppHandle, message.c_str(), L"NppMenuScripts", MB_OK | MB_ICONWARNING);
-                return;
-            }
-        }
-    }
+    if (currentFile && !prepareCurrentFileScript(scriptPath)) return;
 
     // Hidden shortcut: Ctrl+click a script menu item opens the script in Notepad++
     // instead of executing it.
@@ -4434,8 +4591,7 @@ static bool addMenuItem(HMENU menu, const std::wstring& title, const std::wstrin
     g_scriptPaths.push_back(path);
     g_scriptActions.push_back(action);
     g_executeOptions.emplace_back();
-    const size_t tab = title.find(L'\t');
-    g_scriptTitles.push_back(tab == std::wstring::npos ? title : title.substr(0, tab));
+    g_scriptTitles.push_back(titleWithoutShortcut(title));
     g_cmdIds.push_back(id);
     if (!AppendMenuW(menu, MF_STRING, static_cast<UINT_PTR>(id), title.c_str())) {
         g_scriptPaths.pop_back(); g_scriptActions.pop_back(); g_executeOptions.pop_back();
@@ -4554,7 +4710,7 @@ static void organizeToolbarCommandsInPluginMenu()
         }
     }
 
-    const UINT stopScriptCommandId = static_cast<UINT>(g_allFuncItems[4]._cmdID);
+    const UINT stopScriptCommandId = static_cast<UINT>(g_allFuncItems[3]._cmdID);
     int insertionPosition = GetMenuItemCount(pluginMenu);
     for (int i = 0; i < GetMenuItemCount(pluginMenu); ++i) {
         MENUITEMINFOW menuItem{};
@@ -4600,8 +4756,6 @@ static std::vector<void (*)()> makeToolbarCallbacks(std::index_sequence<Indices.
 {
     return { &toolbarCommand<Indices>... };
 }
-
-static constexpr size_t MAX_TOOLBAR_ITEMS = 32;
 
 static constexpr unsigned int MAX_MENU_NESTING = 16;
 
@@ -5112,9 +5266,11 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
         g_scriptPaths.push_back(action == MenuCommandAction::RunScript ? joinPath(folder, script) :
                                 action == MenuCommandAction::RunMenuCommand ? g_toolbarActionTargets[i] : L"");
         g_scriptActions.push_back(action);
-        g_scriptTitles.push_back(g_toolbarTitles[i]);
+        g_scriptTitles.push_back(titleWithoutShortcut(g_toolbarTitles[i]));
         g_executeOptions.push_back(g_toolbarExecuteOptions[i]);
-        g_cmdIds.push_back(g_cmdBase + static_cast<int>(g_scriptPaths.size()) - 1);
+        const int commandId = g_cmdBase + static_cast<int>(g_scriptPaths.size()) - 1;
+        g_cmdIds.push_back(commandId);
+        registerHotkeyForItem(g_toolbarTitles[i], commandId);
     }
     DrawMenuBar(g_nppData._nppHandle);
     g_installed = true;
@@ -5146,7 +5302,7 @@ extern "C" __declspec(dllexport) const wchar_t* getName() { return PLUGIN_NAME; 
 
 extern "C" __declspec(dllexport) FuncItem* getFuncsArray(int* nbF)
 {
-    swprintf_s(g_funcItems[6]._itemName, L"About NppMenuScripts (v%u.%u.%u.%u)",
+    swprintf_s(g_funcItems[5]._itemName, L"About NppMenuScripts (v%u.%u.%u.%u)",
                NPP_MENUSCRIPTS_VERSION_MAJOR, NPP_MENUSCRIPTS_VERSION_MINOR,
                NPP_MENUSCRIPTS_VERSION_PATCH, NPP_MENUSCRIPTS_VERSION_BUILD);
     if (g_allFuncItems.empty()) {
@@ -5154,7 +5310,8 @@ extern "C" __declspec(dllexport) FuncItem* getFuncsArray(int* nbF)
         const auto callbacks = makeToolbarCallbacks(std::make_index_sequence<MAX_TOOLBAR_ITEMS>{});
         for (size_t i = 0; i < g_toolbarScriptFiles.size(); ++i) {
             FuncItem item{};
-            wcsncpy_s(item._itemName, g_toolbarTitles[i].c_str(), _TRUNCATE);
+            const std::wstring tooltip = toolbarTooltip(g_toolbarTitles[i]);
+            wcsncpy_s(item._itemName, tooltip.c_str(), _TRUNCATE);
             item._pFunc = callbacks[i];
             g_allFuncItems.push_back(item);
         }
