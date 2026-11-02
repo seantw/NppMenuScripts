@@ -6,8 +6,10 @@
 #include <commdlg.h>
 #include <shlobj.h>
 #include <shellapi.h>
+#include <uxtheme.h>
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -64,6 +66,7 @@ struct EditorState {
     HWND title = nullptr;
     HWND shortcutLabel = nullptr;
     HWND shortcut = nullptr;
+    HWND shortcutClear = nullptr;
     HWND icon = nullptr;
     HWND scriptLabel = nullptr;
     HWND script = nullptr;
@@ -105,13 +108,15 @@ struct EditorState {
     HWND menuJsonOpen = nullptr;
     HWND pathsInfoGroup = nullptr;
     HWND pathsInfoText = nullptr;
+    HWND pathsInfoBullet1 = nullptr;
+    HWND pathsInfoText2 = nullptr;
+    HWND pathsInfoBullet2 = nullptr;
     HWND scriptFolderSet = nullptr;
     HWND scriptFolderOpen = nullptr;
     HWND iconFolderSet = nullptr;
     HWND iconFolderOpen = nullptr;
     HWND saveButton = nullptr;
     HFONT font = nullptr;
-    HFONT shortcutPlaceholderFont = nullptr;
     HFONT shortcutClearFont = nullptr;
     HICON customIcon = nullptr;
     HICON iconPreview = nullptr;
@@ -130,7 +135,6 @@ struct EditorState {
     bool dirty = false;
     bool updating = false;
     bool rebuildingTree = false;
-    bool shortcutClearPressed = false;
     int activePage = 0;
     bool draggingTreeItem = false;
     HTREEITEM dragItem = nullptr;
@@ -263,6 +267,33 @@ static std::wstring resolvedPath(const std::wstring& base, const std::wstring& p
     return isAbsolute(path) ? fullPath(path) : joinPath(base, path);
 }
 
+static bool splitIconLocation(const std::wstring& value, std::wstring& path, int& index)
+{
+    const size_t comma = value.find_last_of(L',');
+    if (comma == std::wstring::npos) { path = value; index = 0; return false; }
+    wchar_t* end = nullptr;
+    const long parsed = wcstol(value.c_str() + comma + 1, &end, 10);
+    if (!end || end == value.c_str() + comma + 1 || *end || parsed < INT_MIN || parsed > INT_MAX)
+        { path = value; index = 0; return false; }
+    path = value.substr(0, comma);
+    index = static_cast<int>(parsed);
+    return !path.empty();
+}
+
+static HICON loadIconLocation(const std::wstring& base, const std::wstring& value, int cx, int cy)
+{
+    std::wstring path;
+    int index = 0;
+    const bool indexed = splitIconLocation(value, path, index);
+    path = resolvedPath(base, path);
+    if (!indexed)
+        return static_cast<HICON>(LoadImageW(nullptr, path.c_str(), IMAGE_ICON, cx, cy, LR_LOADFROMFILE));
+    HICON large = nullptr, small = nullptr;
+    if (!ExtractIconExW(path.c_str(), index, &large, &small, 1)) return nullptr;
+    if (large) { if (small) DestroyIcon(small); return large; }
+    return small;
+}
+
 static bool fileExists(const std::wstring& path)
 {
     const DWORD attrs = GetFileAttributesW(path.c_str());
@@ -323,6 +354,89 @@ static HWND control(EditorState& s, const wchar_t* type, const std::wstring& lab
     return hwnd;
 }
 
+static std::vector<std::wstring> splitPathInfoParagraphs(const std::wstring& text)
+{
+    std::vector<std::wstring> paragraphs;
+    std::wstring paragraph;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == L'\r' || text[i] == L'\n') {
+            if (!paragraph.empty()) {
+                paragraphs.push_back(std::move(paragraph));
+                paragraph.clear();
+            }
+            while (i + 1 < text.size() && (text[i + 1] == L'\r' || text[i + 1] == L'\n')) ++i;
+        } else {
+            paragraph.push_back(text[i]);
+        }
+    }
+    if (!paragraph.empty()) paragraphs.push_back(std::move(paragraph));
+    return paragraphs;
+}
+
+static int measureWrappedStaticHeight(HWND hwnd, const std::wstring& text)
+{
+    RECT client{};
+    if (!hwnd || !GetClientRect(hwnd, &client)) return 0;
+    RECT measure{0, 0, client.right, 0};
+    HDC dc = GetDC(hwnd);
+    if (!dc) return 0;
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(hwnd, WM_GETFONT, 0, 0));
+    HGDIOBJ previousFont = font ? SelectObject(dc, font) : nullptr;
+    DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &measure,
+              DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    if (previousFont) SelectObject(dc, previousFont);
+    ReleaseDC(hwnd, dc);
+    return std::max<LONG>(14, measure.bottom - measure.top + 1);
+}
+
+static bool getChildRectInParent(HWND parent, HWND child, RECT& rect)
+{
+    if (!parent || !child || !GetWindowRect(child, &rect)) return false;
+    MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&rect), 2);
+    return true;
+}
+
+static void layoutPathsInfo(EditorState& s)
+{
+    if (!s.settingsForm || !s.pathsInfoText || !s.pathsInfoText2 ||
+        !s.pathsInfoBullet1 || !s.pathsInfoBullet2) return;
+
+    const std::vector<std::wstring> paragraphs = splitPathInfoParagraphs(tr(s, "ConfigPathsInfoText"));
+    const std::wstring bullet = L"•";
+    SetWindowTextW(s.pathsInfoBullet1, paragraphs.empty() ? L"" : bullet.c_str());
+    SetWindowTextW(s.pathsInfoText, paragraphs.empty() ? L"" : paragraphs[0].c_str());
+    SetWindowTextW(s.pathsInfoBullet2, paragraphs.size() < 2 ? L"" : bullet.c_str());
+    SetWindowTextW(s.pathsInfoText2, paragraphs.size() < 2 ? L"" : paragraphs[1].c_str());
+
+    RECT firstText{}, secondText{}, firstBullet{}, secondBullet{};
+    if (!getChildRectInParent(s.settingsForm, s.pathsInfoText, firstText) ||
+        !getChildRectInParent(s.settingsForm, s.pathsInfoText2, secondText) ||
+        !getChildRectInParent(s.settingsForm, s.pathsInfoBullet1, firstBullet) ||
+        !getChildRectInParent(s.settingsForm, s.pathsInfoBullet2, secondBullet)) return;
+
+    const int firstHeight = measureWrappedStaticHeight(s.pathsInfoText,
+        paragraphs.empty() ? std::wstring() : paragraphs[0]);
+    const int secondHeight = measureWrappedStaticHeight(s.pathsInfoText2,
+        paragraphs.size() < 2 ? std::wstring() : paragraphs[1]);
+    const int paragraphGap = 7;
+    const int secondY = firstText.top + firstHeight + paragraphGap;
+
+    SetWindowPos(s.pathsInfoText, nullptr, firstText.left, firstText.top,
+                 firstText.right - firstText.left, firstHeight,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(s.pathsInfoBullet1, nullptr, firstBullet.left, firstText.top,
+                 firstBullet.right - firstBullet.left, firstHeight,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(s.pathsInfoText2, nullptr, secondText.left, secondY,
+                 secondText.right - secondText.left, secondHeight,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(s.pathsInfoBullet2, nullptr, secondBullet.left, secondY,
+                 secondBullet.right - secondBullet.left, secondHeight,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    ShowWindow(s.pathsInfoBullet2, paragraphs.size() > 1 ? SW_SHOW : SW_HIDE);
+    ShowWindow(s.pathsInfoText2, paragraphs.size() > 1 ? SW_SHOW : SW_HIDE);
+}
+
 static void show(HWND hwnd, bool visible)
 {
     if (hwnd) ShowWindow(hwnd, visible ? SW_SHOW : SW_HIDE);
@@ -334,11 +448,13 @@ static void showChildDialogAndRepaint(HWND parent, HWND child)
     RECT bounds{};
     const bool hasBounds = GetWindowRect(child, &bounds) != FALSE;
     if (hasBounds) MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&bounds), 2);
-    ShowWindow(child, SW_SHOW);
     if (hasBounds) InvalidateRect(parent, &bounds, TRUE);
+    // Clear the parent first, then paint the page on top. Updating the parent
+    // after the child can leave parent pixels over the child dialog.
+    if (hasBounds) UpdateWindow(parent);
+    ShowWindow(child, SW_SHOW);
     InvalidateRect(child, nullptr, TRUE);
     UpdateWindow(child);
-    if (hasBounds) UpdateWindow(parent);
 }
 
 static void offsetControlY(HWND hwnd, int pixels)
@@ -353,6 +469,84 @@ static void offsetControlY(HWND hwnd, int pixels)
     }
     SetWindowPos(hwnd, nullptr, origin.x, origin.y + pixels, 0, 0,
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void offsetControlX(HWND hwnd, int pixels)
+{
+    if (!hwnd) return;
+    RECT rect{};
+    if (!GetWindowRect(hwnd, &rect)) return;
+    POINT origin{rect.left, rect.top};
+    HWND parent = GetParent(hwnd);
+    if (!parent || !MapWindowPoints(nullptr, parent, &origin, 1)) {
+        if (!parent) return;
+    }
+    SetWindowPos(hwnd, nullptr, origin.x + pixels, origin.y, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void resizeControlBy(HWND hwnd, int widthDelta, int heightDelta)
+{
+    if (!hwnd) return;
+    RECT rect{};
+    if (!GetWindowRect(hwnd, &rect)) return;
+    SetWindowPos(hwnd, nullptr, 0, 0,
+                 rect.right - rect.left + widthDelta,
+                 rect.bottom - rect.top + heightDelta,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void centerChildHorizontally(HWND parent, HWND child)
+{
+    if (!parent || !child) return;
+    RECT parentRect{}, childRect{};
+    if (!GetClientRect(parent, &parentRect) || !GetWindowRect(child, &childRect)) return;
+    MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&childRect), 2);
+    const int width = childRect.right - childRect.left;
+    SetWindowPos(child, nullptr, (parentRect.right - width) / 2, childRect.top,
+                 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void setEditTextMargins(HWND hwnd)
+{
+    if (!hwnd) return;
+    SendMessageW(hwnd, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(3, 3));
+}
+
+static void showShortcutClear(HWND edit, HWND clearButton, bool visible)
+{
+    if (!clearButton) return;
+    if (!visible) {
+        ShowWindow(clearButton, SW_HIDE);
+        return;
+    }
+
+    ShowWindow(clearButton, SW_SHOW);
+    // The clear button intentionally overlaps the edit's reserved right edge.
+    // Put it at the top of the sibling Z order each time it is shown, then
+    // repaint it after the edit so mouse-triggered edit paints cannot cover it.
+    SetWindowPos(clearButton, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (edit) InvalidateRect(edit, nullptr, TRUE);
+    InvalidateRect(clearButton, nullptr, TRUE);
+    UpdateWindow(clearButton);
+}
+
+static void setMultilineTextOrigin(HWND hwnd, int left, int top)
+{
+    if (!hwnd) return;
+    RECT rect{};
+    SendMessageW(hwnd, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&rect));
+    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    const int borderX = (style & WS_BORDER) ? GetSystemMetrics(SM_CXBORDER) : 0;
+    const int borderY = (style & WS_BORDER) ? GetSystemMetrics(SM_CYBORDER) : 0;
+    // Microsoft documents that the border must be excluded when reusing an
+    // EM_GETRECT result as the EM_SETRECT input.
+    rect.left = std::max<LONG>(0, rect.left - borderX + left);
+    rect.top = std::max<LONG>(0, rect.top - borderY + top);
+    rect.right = std::max<LONG>(rect.left + 1, rect.right - borderX);
+    rect.bottom = std::max<LONG>(rect.top + 1, rect.bottom - borderY);
+    SendMessageW(hwnd, EM_SETRECT, 0, reinterpret_cast<LPARAM>(&rect));
 }
 
 static EditorNode* makeNode(EditorState& s, NodeKind kind, cJSON* value, cJSON* parent,
@@ -962,8 +1156,7 @@ static void updateIconPreview(EditorState& s)
     if (s.customIcon) { DestroyIcon(s.customIcon); s.customIcon = nullptr; }
     HICON icon = nullptr;
     if (!s.currentIconPath.empty()) {
-        const std::wstring path = resolvedPath(s.iconFolder, s.currentIconPath);
-        icon = static_cast<HICON>(LoadImageW(nullptr, path.c_str(), IMAGE_ICON, 32, 32, LR_LOADFROMFILE));
+        icon = loadIconLocation(s.iconFolder, s.currentIconPath, 32, 32);
         if (icon) s.customIcon = icon;
     }
     if (!icon) icon = static_cast<HICON>(LoadImageW(s.context.module, MAKEINTRESOURCEW(101), IMAGE_ICON, 32, 32, LR_SHARED));
@@ -974,8 +1167,6 @@ static void updateIconPreview(EditorState& s)
 
 static LRESULT CALLBACK shortcutSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 static LRESULT CALLBACK helpLinkSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
-static void applySingleLineEditInsets(HWND);
-static void applyMultilineEditInsets(HWND);
 
 static HWND itemFormFor(EditorState& s, EditorNode* node)
 {
@@ -1001,9 +1192,10 @@ static void bindItemForm(EditorState& s, EditorNode* node)
         if (other && other != form) ShowWindow(other, SW_HIDE);
     s.activeItemForm = form;
     auto get = [form](int id) { return form ? GetDlgItem(form, id) : nullptr; };
-    s.header = GetDlgItem(s.hwnd, ID_HEADER);
+    s.header = form ? GetDlgItem(form, ID_HEADER) : nullptr;
     s.titleLabel = get(ID_TITLE_LABEL); s.title = get(ID_TITLE);
     s.shortcutLabel = get(ID_SHORTCUT_LABEL); s.shortcut = get(ID_SHORTCUT);
+    s.shortcutClear = get(ID_SHORTCUT_CLEAR);
     s.icon = get(ID_ICON);
     s.scriptLabel = get(ID_SCRIPT_LABEL); s.script = get(ID_SCRIPT);
     s.scriptBrowse = get(ID_SCRIPT_BROWSE); s.scriptEdit = get(ID_SCRIPT_EDIT);
@@ -1019,19 +1211,10 @@ static void bindItemForm(EditorState& s, EditorNode* node)
 
     if (s.shortcut) {
         SetWindowSubclass(s.shortcut, shortcutSubclass, 1, reinterpret_cast<DWORD_PTR>(&s));
-        const DWORD margins = static_cast<DWORD>(SendMessageW(s.shortcut, EM_GETMARGINS, 0, 0));
-        SendMessageW(s.shortcut, EM_SETMARGINS, EC_RIGHTMARGIN, MAKELONG(LOWORD(margins), 30));
     }
     if (s.commandHelp) SetWindowSubclass(s.commandHelp, helpLinkSubclass, 1, reinterpret_cast<DWORD_PTR>(&s));
     if (s.envHelp) SetWindowSubclass(s.envHelp, helpLinkSubclass, 1, reinterpret_cast<DWORD_PTR>(&s));
 
-    for (HWND edit : {s.title, s.shortcut, s.script, s.actionTarget}) applySingleLineEditInsets(edit);
-    for (HWND edit : {s.command, s.envList}) applyMultilineEditInsets(edit);
-    if (s.codePage) {
-        COMBOBOXINFO comboInfo{sizeof(comboInfo)};
-        if (GetComboBoxInfo(s.codePage, &comboInfo) && comboInfo.hwndItem)
-            applySingleLineEditInsets(comboInfo.hwndItem);
-    }
     for (HWND combo : {s.action, s.runIn, s.codePage}) if (combo) {
         SendMessageW(combo, CB_SETITEMHEIGHT, 1, 25);
         SendMessageW(combo, CB_SETITEMHEIGHT, 0, 22);
@@ -1085,8 +1268,9 @@ static void loadSelected(EditorState& s, EditorNode* node)
         if (cJSON_IsString(titleItem)) title = fromUtf8(titleItem->valuestring);
     }
     const auto titleParts = splitShortcut(title);
-    SetWindowTextW(s.title, titleParts.first.c_str());
-    SetWindowTextW(s.shortcut, titleParts.second.c_str());
+    if (s.title) SetWindowTextW(s.title, titleParts.first.c_str());
+    if (s.shortcut) SetWindowTextW(s.shortcut, titleParts.second.c_str());
+    showShortcutClear(s.shortcut, s.shortcutClear, !titleParts.second.empty());
     if (node && node->kind == NodeKind::Script) {
         cJSON* value = member(node->value, "script");
         SetWindowTextW(s.script, cJSON_IsString(value) ? fromUtf8(value->valuestring).c_str() : L"");
@@ -1158,14 +1342,10 @@ static bool commitSelected(EditorState& s)
     if (!node || node->kind == NodeKind::MenuRoot || node->kind == NodeKind::ToolbarRoot || node->kind == NodeKind::Separator) return true;
     if (node->topMenu) {
         std::wstring title = readText(s.title);
-        const std::wstring shortcut = readText(s.shortcut);
-        if (!shortcut.empty()) title += L"\t" + shortcut;
         if (toUtf8(title) != (node->value->string ? node->value->string : "")) setPropertyName(node->value, title);
         return true;
     }
     std::wstring title = readText(s.title);
-    const std::wstring shortcut = readText(s.shortcut);
-    if (!shortcut.empty()) title += L"\t" + shortcut;
     if (!setObjectString(node->value, "title", title)) return false;
     if (node->kind == NodeKind::Script) {
         if (!setObjectString(node->value, "script", storedScriptPath(s.scriptFolder, readText(s.script)))) return false;
@@ -1323,11 +1503,19 @@ static bool validateAndCommit(EditorState& s, std::wstring& error)
         cJSON* icon = member(item, "icon");
         if (icon) {
             if (!cJSON_IsString(icon)) { error = tr(s, "ConfigInvalidJson"); return false; }
-            const std::wstring iconPath = fromUtf8(icon->valuestring);
-            if (iconPath.size() < 4 || _wcsicmp(iconPath.c_str() + iconPath.size() - 4, L".ico") != 0 ||
-                !fileExists(resolvedPath(s.iconFolder, iconPath))) {
+            std::wstring iconPath;
+            int iconIndex = 0;
+            const std::wstring iconValue = fromUtf8(icon->valuestring);
+            const bool indexed = splitIconLocation(iconValue, iconPath, iconIndex);
+            const std::wstring resolved = resolvedPath(s.iconFolder, iconPath);
+            HICON check = nullptr;
+            if (indexed) check = loadIconLocation(L"", resolved + L"," + std::to_wstring(iconIndex), 16, 16);
+            else if (iconPath.size() >= 4 && _wcsicmp(iconPath.c_str() + iconPath.size() - 4, L".ico") == 0 && fileExists(resolved))
+                check = static_cast<HICON>(LoadImageW(nullptr, resolved.c_str(), IMAGE_ICON, 16, 16, LR_LOADFROMFILE));
+            if (!check) {
                 error = tr(s, "ConfigIconMissing"); return false;
             }
+            DestroyIcon(check);
         }
     }
     if (s.context.validate && !s.context.validate(s.root, error)) return false;
@@ -1408,11 +1596,35 @@ static void chooseIcon(EditorState& s)
 {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, 1, tr(s, "ConfigChooseIcon").c_str());
+    AppendMenuW(menu, MF_STRING, 3, tr(s, "ConfigChooseWindowsIcon").c_str());
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 2, tr(s, "ConfigUseDefaultIcon").c_str());
     RECT rect{}; GetWindowRect(s.icon, &rect);
     const UINT choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, rect.left, rect.bottom, 0, s.hwnd, nullptr);
     DestroyMenu(menu);
     if (choice == 2) { s.currentIconPath.clear(); if (s.customIcon) { DestroyIcon(s.customIcon); s.customIcon = nullptr; } updateIconPreview(s); s.dirty = true; return; }
+    if (choice == 3) {
+        wchar_t systemDir[MAX_PATH + 1]{};
+        const UINT length = GetSystemDirectoryW(systemDir, static_cast<UINT>(std::size(systemDir)));
+        if (!length || length >= std::size(systemDir)) return;
+        std::wstring initialPath(systemDir, length);
+        initialPath += L"\\shell32.dll";
+        wchar_t selectedPath[MAX_PATH]{};
+        wcsncpy_s(selectedPath, initialPath.c_str(), _TRUNCATE);
+        int selectedIndex = 0;
+        if (!PickIconDlg(s.hwnd, selectedPath, static_cast<UINT>(std::size(selectedPath)), &selectedIndex)) return;
+        const std::wstring selected = fullPath(selectedPath);
+        const std::wstring spec = selected + L"," + std::to_wstring(selectedIndex);
+        HICON loaded = loadIconLocation(L"", spec, 32, 32);
+        if (!loaded) { MessageBoxW(s.hwnd, tr(s, "ConfigIconMissing").c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING); return; }
+        if (s.customIcon) DestroyIcon(s.customIcon);
+        s.customIcon = loaded;
+        s.iconPreview = loaded;
+        s.currentIconPath = spec;
+        InvalidateRect(s.icon, nullptr, TRUE);
+        s.dirty = true;
+        return;
+    }
     if (choice != 1) return;
     wchar_t file[32768]{};
     OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = s.hwnd;
@@ -1622,95 +1834,15 @@ static int CALLBACK folderBrowseCallback(HWND hwnd, UINT message, LPARAM, LPARAM
     return FALSE;
 }
 
-static RECT shortcutClearHitRect(HWND hwnd)
-{
-    RECT rect{};
-    GetClientRect(hwnd, &rect);
-    rect.left = std::max(rect.left, rect.right - 20);
-    rect.right -= 2;
-    ++rect.top;
-    --rect.bottom;
-    return rect;
-}
-
 static LRESULT CALLBACK shortcutSubclass(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
                                          UINT_PTR, DWORD_PTR data)
 {
     auto* state = reinterpret_cast<EditorState*>(data);
-    if (message == WM_PAINT && state) {
-        const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
-        HDC dc = GetDC(hwnd);
-        if (dc) {
-            RECT rect{};
-            if (GetClientRect(hwnd, &rect)) {
-                if (GetWindowTextLengthW(hwnd) == 0) {
-                    const DWORD margins = static_cast<DWORD>(SendMessageW(hwnd, EM_GETMARGINS, 0, 0));
-                    rect.left += LOWORD(margins) + 1;
-                    rect.right -= HIWORD(margins) + 2;
-                    HGDIOBJ oldFont = state->shortcutPlaceholderFont
-                        ? SelectObject(dc, state->shortcutPlaceholderFont) : nullptr;
-                    SetBkMode(dc, TRANSPARENT);
-                    SetTextColor(dc, RGB(160, 160, 160));
-                    DrawTextW(dc, state->shortcutHintText.c_str(),
-                              static_cast<int>(state->shortcutHintText.size()), &rect,
-                              DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
-                    if (oldFont) SelectObject(dc, oldFont);
-                } else {
-                    const RECT clearRect = shortcutClearHitRect(hwnd);
-                    const int centerX = (clearRect.left + clearRect.right) / 2;
-                    const int centerY = (clearRect.top + clearRect.bottom) / 2;
-                    RECT glyphRect{centerX - 12, centerY - 13, centerX + 12, centerY + 11};
-                    HGDIOBJ oldFont = state->shortcutClearFont
-                        ? SelectObject(dc, state->shortcutClearFont) : nullptr;
-                    SetBkMode(dc, TRANSPARENT);
-                    SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
-                    DrawTextW(dc, L"×", 1, &glyphRect,
-                              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                    if (oldFont) SelectObject(dc, oldFont);
-                }
-            }
-            ReleaseDC(hwnd, dc);
-        }
-        return result;
-    }
-    if (message == WM_SETCURSOR && state && GetWindowTextLengthW(hwnd) > 0) {
-        POINT point{};
-        GetCursorPos(&point);
-        ScreenToClient(hwnd, &point);
-        const RECT clearRect = shortcutClearHitRect(hwnd);
-        if (PtInRect(&clearRect, point)) {
-            SetCursor(LoadCursor(nullptr, IDC_HAND));
-            return TRUE;
-        }
-    }
-    if (message == WM_LBUTTONDOWN && state && GetWindowTextLengthW(hwnd) > 0) {
-        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        const RECT clearRect = shortcutClearHitRect(hwnd);
-        if (PtInRect(&clearRect, point)) {
-            state->shortcutClearPressed = true;
-            SetCapture(hwnd);
-            SetFocus(hwnd);
-            return 0;
-        }
-    }
-    if (message == WM_LBUTTONUP && state && state->shortcutClearPressed) {
-        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        const RECT clearRect = shortcutClearHitRect(hwnd);
-        state->shortcutClearPressed = false;
-        if (GetCapture() == hwnd) ReleaseCapture();
-        if (PtInRect(&clearRect, point)) {
-            SetWindowTextW(hwnd, L"");
-            state->dirty = true;
-            PostMessageW(state->hwnd, TITLE_REFRESH_MESSAGE, 0, 0);
-        }
-        InvalidateRect(hwnd, nullptr, TRUE);
-        return 0;
-    }
-    if (message == WM_CAPTURECHANGED && state) state->shortcutClearPressed = false;
     if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && state) {
         const UINT key = static_cast<UINT>(wParam);
         if (key == VK_ESCAPE) {
             SetWindowTextW(hwnd, L"");
+            showShortcutClear(hwnd, state->shortcutClear, false);
             state->dirty = true;
             PostMessageW(state->hwnd, TITLE_REFRESH_MESSAGE, 0, 0);
             return 0;
@@ -1731,81 +1863,13 @@ static LRESULT CALLBACK shortcutSubclass(HWND hwnd, UINT message, WPARAM wParam,
         if (key >= VK_F1 && key <= VK_F24) text += L"F" + std::to_wstring(key - VK_F1 + 1);
         else text += static_cast<wchar_t>(key);
         SetWindowTextW(hwnd, text.c_str());
+        showShortcutClear(hwnd, state->shortcutClear, true);
         state->dirty = true;
         PostMessageW(state->hwnd, TITLE_REFRESH_MESSAGE, 0, 0);
         return 0;
     }
     if (message == WM_NCDESTROY) RemoveWindowSubclass(hwnd, shortcutSubclass, 1);
     return DefSubclassProc(hwnd, message, wParam, lParam);
-}
-
-static LRESULT CALLBACK singleLineEditInsetSubclass(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
-                                                     UINT_PTR subclassId, DWORD_PTR)
-{
-    if (message == WM_NCCALCSIZE) {
-        const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
-        if (wParam) {
-            auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
-            if (params) ++params->rgrc[0].top;
-        } else {
-            auto* client = reinterpret_cast<RECT*>(lParam);
-            if (client) ++client->top;
-        }
-        return result;
-    }
-    if (message == WM_NCPAINT) {
-        const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
-        RECT windowRect{}, clientRect{};
-        if (GetWindowRect(hwnd, &windowRect) && GetClientRect(hwnd, &clientRect)) {
-            MapWindowPoints(hwnd, nullptr, reinterpret_cast<POINT*>(&clientRect), 2);
-            const int width = windowRect.right - windowRect.left;
-            const int clientTop = clientRect.top - windowRect.top;
-            const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-            const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            const int borderX = (exStyle & WS_EX_CLIENTEDGE) ? GetSystemMetrics(SM_CXEDGE) :
-                                ((style & WS_BORDER) ? GetSystemMetrics(SM_CXBORDER) : 0);
-            const int borderY = (exStyle & WS_EX_CLIENTEDGE) ? GetSystemMetrics(SM_CYEDGE) :
-                                ((style & WS_BORDER) ? GetSystemMetrics(SM_CYBORDER) : 0);
-            if (clientTop > borderY) {
-                HDC dc = GetWindowDC(hwnd);
-                if (dc) {
-                    RECT gap{borderX, borderY, width - borderX, clientTop};
-                    FillRect(dc, &gap, GetSysColorBrush(COLOR_WINDOW));
-                    ReleaseDC(hwnd, dc);
-                }
-            }
-        }
-        return result;
-    }
-    if (message == WM_NCDESTROY) RemoveWindowSubclass(hwnd, singleLineEditInsetSubclass, subclassId);
-    return DefSubclassProc(hwnd, message, wParam, lParam);
-}
-
-static void applySingleLineEditInsets(HWND hwnd)
-{
-    if (!hwnd) return;
-    static constexpr wchar_t propertyName[] = L"NppMenuScripts.SingleLineEditInsets";
-    if (GetPropW(hwnd, propertyName)) return;
-
-    const DWORD margins = static_cast<DWORD>(SendMessageW(hwnd, EM_GETMARGINS, 0, 0));
-    const WORD left = static_cast<WORD>(LOWORD(margins) + 2);
-    SendMessageW(hwnd, EM_SETMARGINS, EC_LEFTMARGIN, MAKELONG(left, HIWORD(margins)));
-    if (SetWindowSubclass(hwnd, singleLineEditInsetSubclass, 1, 0)) {
-        SetPropW(hwnd, propertyName, reinterpret_cast<HANDLE>(1));
-        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    }
-}
-
-static void applyMultilineEditInsets(HWND hwnd)
-{
-    if (!hwnd) return;
-    RECT rect{};
-    SendMessageW(hwnd, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&rect));
-    rect.left += 2;
-    rect.top += 1;
-    SendMessageW(hwnd, EM_SETRECT, 0, reinterpret_cast<LPARAM>(&rect));
-    InvalidateRect(hwnd, nullptr, TRUE);
 }
 
 static LRESULT CALLBACK helpLinkSubclass(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
@@ -1936,7 +2000,12 @@ static bool confirmPendingChanges(EditorState& s)
 
 static void onCommand(EditorState& s, int id, int notification)
 {
-    if (id == ID_NEW && notification == BN_CLICKED) {
+    if (id == ID_SHORTCUT_CLEAR && notification == BN_CLICKED) {
+        SetWindowTextW(s.shortcut, L"");
+        showShortcutClear(s.shortcut, s.shortcutClear, false);
+        s.dirty = true;
+        PostMessageW(s.hwnd, TITLE_REFRESH_MESSAGE, 0, 0);
+    } else if (id == ID_NEW && notification == BN_CLICKED) {
         HMENU menu = CreatePopupMenu();
         const bool menuRoot = s.selected && s.selected->kind == NodeKind::MenuRoot;
         const bool toolbarRoot = s.selected && s.selected->kind == NodeKind::ToolbarRoot;
@@ -2067,10 +2136,28 @@ static bool drawComboItem(const DRAWITEMSTRUCT& draw)
     SetBkMode(draw.hDC, TRANSPARENT);
     SetTextColor(draw.hDC, GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT));
     RECT textRect = draw.rcItem;
-    textRect.left += 5;
+    textRect.left += draw.CtlID == ID_CODE_PAGE ? 3 : 5;
     textRect.right -= 3;
     DrawTextW(draw.hDC, text.c_str(), static_cast<int>(text.size()), &textRect,
               DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+    return true;
+}
+
+static bool drawShortcutClear(const DRAWITEMSTRUCT& draw, HFONT font)
+{
+    if (draw.CtlType != ODT_BUTTON || draw.CtlID != ID_SHORTCUT_CLEAR) return false;
+
+    // Do not fill the owner-drawn button: the shortcut edit below it supplies
+    // the background. Use the familiar multiplication-sign close glyph.
+    const int saved = SaveDC(draw.hDC);
+    SetBkMode(draw.hDC, TRANSPARENT);
+    SetTextColor(draw.hDC, GetSysColor((draw.itemState & ODS_DISABLED) ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT));
+    HGDIOBJ oldFont = font ? SelectObject(draw.hDC, font) : nullptr;
+    RECT textRect = draw.rcItem;
+    DrawTextW(draw.hDC, L"×", 1, &textRect,
+              DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+    if (oldFont) SelectObject(draw.hDC, oldFont);
+    if (saved) RestoreDC(draw.hDC, saved);
     return true;
 }
 
@@ -2078,7 +2165,7 @@ static bool drawHelpLink(const DRAWITEMSTRUCT& draw)
 {
     if (draw.CtlType != ODT_BUTTON ||
         (draw.CtlID != ID_COMMAND_HELP && draw.CtlID != ID_ENV_HELP)) return false;
-    FillRect(draw.hDC, &draw.rcItem, GetSysColorBrush(COLOR_BTNFACE));
+    // Leave the button background untouched so the page background shows through.
     HFONT font = reinterpret_cast<HFONT>(SendMessageW(draw.hwndItem, WM_GETFONT, 0, 0));
     HGDIOBJ oldFont = font ? SelectObject(draw.hDC, font) : nullptr;
     SetBkMode(draw.hDC, TRANSPARENT);
@@ -2131,6 +2218,18 @@ static INT_PTR CALLBACK pageDialogProc(HWND hwnd, UINT message, WPARAM wParam, L
     }
     if (!s) return FALSE;
     switch (message) {
+    case WM_CTLCOLORSTATIC:
+        {
+            HWND control = reinterpret_cast<HWND>(lParam);
+            wchar_t className[32]{};
+            if (control && GetClassNameW(control, className, _countof(className)) &&
+                _wcsicmp(className, L"Edit") == 0)
+                return FALSE; // Let the dialog manager paint read-only/disabled edits normally.
+        }
+        // Static labels should reveal the tab-textured page background instead
+        // of painting the default gray button-face rectangle behind their text.
+        SetBkMode(reinterpret_cast<HDC>(wParam), TRANSPARENT);
+        return reinterpret_cast<INT_PTR>(GetStockObject(NULL_BRUSH));
     case WM_COMMAND: case WM_NOTIFY: case WM_DRAWITEM: case WM_MEASUREITEM: case WM_HSCROLL:
         return SendMessageW(s->hwnd, message, wParam, lParam);
     }
@@ -2139,11 +2238,13 @@ static INT_PTR CALLBACK pageDialogProc(HWND hwnd, UINT message, WPARAM wParam, L
 
 static HWND createPageForm(EditorState& s, int resourceId)
 {
-    return CreateDialogParamW(s.context.module, MAKEINTRESOURCEW(resourceId), s.hwnd,
-                              pageDialogProc, reinterpret_cast<LPARAM>(&s));
+    HWND form = CreateDialogParamW(s.context.module, MAKEINTRESOURCEW(resourceId), s.hwnd,
+                                  pageDialogProc, reinterpret_cast<LPARAM>(&s));
+    if (form) EnableThemeDialogTexture(form, ETDT_ENABLETAB);
+    return form;
 }
 
-static void layoutPageForm(EditorState& s, HWND form, const RECT& bounds)
+static void layoutPageForm(EditorState& s, HWND form, const RECT& bounds, LONG childReferenceLeft)
 {
     if (!form || bounds.right <= bounds.left || bounds.bottom <= bounds.top) return;
 
@@ -2164,9 +2265,18 @@ static void layoutPageForm(EditorState& s, HWND form, const RECT& bounds)
                  SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     for (const ChildPlacement& child : children) {
         const RECT& rect = child.dialogRect;
-        SetWindowPos(child.hwnd, nullptr, rect.left - bounds.left, rect.top - bounds.top,
+        SetWindowPos(child.hwnd, nullptr, rect.left - childReferenceLeft, rect.top - bounds.top,
                      rect.right - rect.left, rect.bottom - rect.top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    // Each page owns its group box so the themed group-box caption is painted
+    // over that page's tab-textured background. Size it in client pixels,
+    // rather than reusing dialog-template units as pixel coordinates.
+    HWND header = GetDlgItem(form, ID_HEADER);
+    RECT client{};
+    if (header && GetClientRect(form, &client)) {
+        SetWindowPos(header, HWND_BOTTOM, 0, 0, client.right, client.bottom,
+                     SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     }
 }
 
@@ -2175,10 +2285,6 @@ static void layoutPageForms(EditorState& s)
     RECT tabRect{};
     if (s.tab && GetWindowRect(s.tab, &tabRect))
         MapWindowPoints(nullptr, s.hwnd, reinterpret_cast<POINT*>(&tabRect), 2);
-    RECT header{};
-    HWND sampleHeader = GetDlgItem(s.hwnd, ID_HEADER);
-    if (sampleHeader && GetWindowRect(sampleHeader, &header))
-        MapWindowPoints(nullptr, s.hwnd, reinterpret_cast<POINT*>(&header), 2);
     RECT settingsPage{};
     if (s.tab && GetClientRect(s.tab, &settingsPage)) {
         // The input is the tab control's window client rectangle. Convert it
@@ -2186,17 +2292,27 @@ static void layoutPageForms(EditorState& s)
         SendMessageW(s.tab, TCM_ADJUSTRECT, FALSE, reinterpret_cast<LPARAM>(&settingsPage));
         MapWindowPoints(s.tab, s.hwnd, reinterpret_cast<POINT*>(&settingsPage), 2);
     } else settingsPage = tabRect;
-    const LONG itemTop = header.top ? header.top + 12 : 50;
-    const LONG rightPaneLeft = header.left ? header.left + 8 : 151;
-    const LONG itemRight = header.right ? header.right - 6 : settingsPage.right;
-    const LONG itemBottom = header.bottom ? header.bottom - 12 : settingsPage.bottom;
+    RECT header{};
+    HWND sampleHeader = GetDlgItem(s.hwnd, ID_HEADER);
+    if (sampleHeader && GetWindowRect(sampleHeader, &header))
+        MapWindowPoints(nullptr, s.hwnd, reinterpret_cast<POINT*>(&header), 2);
+    const LONG itemLeft = header.left ? header.left : 143;
+    const LONG itemTop = header.top ? header.top : 38;
+    const LONG itemRight = header.right ? header.right : settingsPage.right;
+    const LONG itemBottom = header.bottom ? header.bottom : settingsPage.bottom;
+    const LONG pageLeft = settingsPage.left ? settingsPage.left : itemLeft;
+    const LONG pageTop = settingsPage.top ? settingsPage.top : itemTop;
     const LONG pageRight = settingsPage.right ? settingsPage.right : itemRight;
     const LONG pageBottom = settingsPage.bottom ? settingsPage.bottom : itemBottom;
-    RECT itemRegion{rightPaneLeft, itemTop,
+    RECT itemRegion{std::max(itemLeft, pageLeft), std::max(itemTop, pageTop),
                     std::min(itemRight, pageRight), std::min(itemBottom, pageBottom)};
+    // The menu-item group and its controls move with the widened tree pane.
+    // The 93 px reference offset is the requested rendered-pixel change.
+    const LONG originalItemLeft = itemRegion.left - 93;
     for (HWND form : {s.emptyForm, s.scriptForm, s.actionForm, s.executeForm,
-                      s.submenuForm, s.separatorForm}) layoutPageForm(s, form, itemRegion);
-    layoutPageForm(s, s.settingsForm, settingsPage);
+                      s.submenuForm, s.separatorForm})
+        layoutPageForm(s, form, itemRegion, originalItemLeft);
+    layoutPageForm(s, s.settingsForm, settingsPage, settingsPage.left);
 }
 
 static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -2215,15 +2331,10 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         s->settingsForm = createPageForm(*s, IDD_PATHS_SETTINGS);
         s->font = reinterpret_cast<HFONT>(SendMessageW(GetDlgItem(s->scriptForm, ID_TITLE), WM_GETFONT, 0, 0));
         if (!s->font) s->font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-        LOGFONTW placeholderFont{};
-        if (GetObjectW(s->font, sizeof(placeholderFont), &placeholderFont) == sizeof(placeholderFont)) {
-            placeholderFont.lfHeight = -12; placeholderFont.lfWeight = FW_NORMAL;
-            placeholderFont.lfItalic = FALSE; placeholderFont.lfUnderline = FALSE; placeholderFont.lfStrikeOut = FALSE;
-            s->shortcutPlaceholderFont = CreateFontIndirectW(&placeholderFont);
-        }
         LOGFONTW clearFont{};
         if (GetObjectW(s->font, sizeof(clearFont), &clearFont) == sizeof(clearFont)) {
-            clearFont.lfHeight = -22; clearFont.lfWeight = FW_NORMAL;
+            clearFont.lfHeight = -16;
+            clearFont.lfWeight = FW_NORMAL;
             s->shortcutClearFont = CreateFontIndirectW(&clearFont);
         }
         SetWindowTextW(hwnd, tr(*s, "ConfigTitle").c_str());
@@ -2255,15 +2366,21 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
                              rect.bottom - rect.top + 1,
                              SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         };
-        registerHeader(hwnd, "ConfigItemSettings");
-        offsetControlY(GetDlgItem(hwnd, ID_HEADER), 2);
+        HWND layoutHeader = GetDlgItem(hwnd, ID_HEADER);
+        if (layoutHeader) ShowWindow(layoutHeader, SW_HIDE);
+        for (HWND form : {s->emptyForm, s->scriptForm, s->actionForm, s->executeForm,
+                          s->submenuForm, s->separatorForm})
+            registerHeader(form, "ConfigItemSettings");
         registerItemForm(s->emptyForm, ID_INFO);
         registerItemForm(s->separatorForm, ID_INFO);
         for (HWND form : {s->scriptForm, s->submenuForm, s->actionForm, s->executeForm}) {
             registerItemForm(form, ID_TITLE_LABEL, tr(*s, "ConfigTitleLabel"));
             registerItemForm(form, ID_TITLE);
-            registerItemForm(form, ID_SHORTCUT_LABEL, tr(*s, "ConfigShortcut"));
-            registerItemForm(form, ID_SHORTCUT);
+            if (form != s->submenuForm) {
+                registerItemForm(form, ID_SHORTCUT_LABEL, tr(*s, "ConfigShortcut"));
+                registerItemForm(form, ID_SHORTCUT);
+                registerItemForm(form, ID_SHORTCUT_CLEAR, L"×");
+            }
             if (form == s->scriptForm) {
                 registerItemForm(form, ID_SCRIPT_LABEL, tr(*s, "ConfigScriptFile"));
                 registerItemForm(form, ID_SCRIPT);
@@ -2291,6 +2408,13 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
             }
         }
         s->shortcutHintText = tr(*s, "ConfigShortcutHint");
+        for (HWND form : {s->scriptForm, s->actionForm, s->executeForm, s->submenuForm}) {
+            HWND shortcut = GetDlgItem(form, ID_SHORTCUT);
+            if (shortcut)
+                SendMessageW(shortcut, EM_SETCUEBANNER, TRUE,
+                             reinterpret_cast<LPARAM>(s->shortcutHintText.c_str()));
+            show(GetDlgItem(form, ID_SHORTCUT_CLEAR), false);
+        }
         const std::wstring envPlaceholder = tr(*s, "ConfigEnvironmentPlaceholder");
         SendMessageW(GetDlgItem(s->executeForm, ID_ENV_LIST), EM_SETCUEBANNER, TRUE,
                      reinterpret_cast<LPARAM>(envPlaceholder.c_str()));
@@ -2314,21 +2438,20 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         s->iconFolderSet = control(*s, L"BUTTON", tr(*s, "ConfigSetFolder"), 0, 0, 0, 0, 0, ID_ICON_FOLDER_SET);
         s->iconFolderOpen = control(*s, L"BUTTON", tr(*s, "ConfigOpenFolder"), 0, 0, 0, 0, 0, ID_ICON_FOLDER_OPEN);
         s->pathsInfoGroup = control(*s, L"BUTTON", tr(*s, "ConfigPathsInfoTitle"), 0, 0, 0, 0, 0, ID_PATHS_INFO_GROUP);
-        s->pathsInfoText = control(*s, L"STATIC", tr(*s, "ConfigPathsInfoText"), 0, 0, 0, 0, 0, ID_PATHS_INFO_TEXT);
+        s->pathsInfoBullet1 = control(*s, L"STATIC", L"", 0, 0, 0, 0, 0, ID_PATHS_INFO_BULLET1);
+        s->pathsInfoText = control(*s, L"STATIC", L"", 0, 0, 0, 0, 0, ID_PATHS_INFO_TEXT);
+        s->pathsInfoBullet2 = control(*s, L"STATIC", L"", 0, 0, 0, 0, 0, ID_PATHS_INFO_BULLET2);
+        s->pathsInfoText2 = control(*s, L"STATIC", L"", 0, 0, 0, 0, 0, ID_PATHS_INFO_TEXT2);
         s->controlParent = hwnd;
         s->saveButton = control(*s, L"BUTTON", L"", 0, 0, 0, 0, 0, ID_SAVE_REBUILD);
         if (s->saveButton) SetWindowTextW(s->saveButton, escapeButtonMnemonics(tr(*s, "ConfigSaveRebuild")).c_str());
         s->workspaceFolder = s->context.workspaceFolder;
         refreshSettingsPaths(*s);
 
-        const int editIds[] = {ID_TITLE, ID_SHORTCUT, ID_SCRIPT, ID_ACTION_TARGET,
-                               ID_WORKSPACE_PATH, ID_MENU_JSON_PATH, ID_SCRIPT_FOLDER_PATH, ID_ICON_FOLDER_PATH};
-        const int multilineIds[] = {ID_COMMAND, ID_ENV_LIST};
         for (HWND form : {s->emptyForm, s->scriptForm, s->actionForm, s->executeForm,
                           s->submenuForm, s->separatorForm}) {
-            for (int id : editIds) applySingleLineEditInsets(GetDlgItem(form, id));
-            for (int id : multilineIds) applyMultilineEditInsets(GetDlgItem(form, id));
-            for (int id : {ID_TITLE_LABEL, ID_TITLE, ID_SHORTCUT_LABEL, ID_SHORTCUT, ID_ICON,
+            for (int id : {ID_TITLE_LABEL, ID_TITLE, ID_SHORTCUT_LABEL, ID_SHORTCUT,
+                           ID_SHORTCUT_CLEAR, ID_ICON,
                            ID_SCRIPT_LABEL, ID_SCRIPT, ID_SCRIPT_BROWSE, ID_SCRIPT_EDIT,
                            ID_ACTION_LABEL, ID_ACTION, ID_ACTION_TARGET_LABEL, ID_ACTION_TARGET,
                            ID_ACTION_HINT, ID_ACTION_HELP, ID_COMMAND_LABEL, ID_COMMAND, ID_COMMAND_HELP,
@@ -2336,8 +2459,31 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
                            ID_CODE_PAGE, ID_ENV_LABEL, ID_ENV_LIST, ID_ENV_HELP, ID_INFO})
                 offsetControlY(GetDlgItem(form, id), 2);
         }
+
+        // These fields were measured one pixel too high. Keep labels and the
+        // other rows fixed, and move only the affected input controls.
+        for (HWND form : {s->scriptForm, s->submenuForm, s->actionForm, s->executeForm}) {
+            offsetControlY(GetDlgItem(form, ID_TITLE), 1);
+            offsetControlY(GetDlgItem(form, ID_SHORTCUT), 1);
+            offsetControlY(GetDlgItem(form, ID_SHORTCUT_CLEAR), 1);
+            offsetControlX(GetDlgItem(form, ID_SHORTCUT_CLEAR), 4);
+        }
+        offsetControlY(GetDlgItem(s->executeForm, ID_CODE_PAGE), 1);
+
+        // Keep horizontal text margins consistent across standard EDIT fields.
+        for (HWND form : {s->scriptForm, s->actionForm, s->executeForm, s->submenuForm}) {
+            setEditTextMargins(GetDlgItem(form, ID_TITLE));
+            setEditTextMargins(GetDlgItem(form, ID_SHORTCUT));
+        }
+        setEditTextMargins(GetDlgItem(s->scriptForm, ID_SCRIPT));
+        setEditTextMargins(GetDlgItem(s->actionForm, ID_ACTION_TARGET));
         for (int id : {ID_WORKSPACE_PATH, ID_MENU_JSON_PATH, ID_SCRIPT_FOLDER_PATH, ID_ICON_FOLDER_PATH})
-            applySingleLineEditInsets(GetDlgItem(s->settingsForm, id));
+            setEditTextMargins(GetDlgItem(s->settingsForm, id));
+        COMBOBOXINFO codePageCombo{sizeof(codePageCombo)};
+        if (GetComboBoxInfo(GetDlgItem(s->executeForm, ID_CODE_PAGE), &codePageCombo) && codePageCombo.hwndItem)
+            setEditTextMargins(codePageCombo.hwndItem);
+        setMultilineTextOrigin(GetDlgItem(s->executeForm, ID_COMMAND), 2, 1);
+        setMultilineTextOrigin(GetDlgItem(s->executeForm, ID_ENV_LIST), 2, 1);
 
         s->controlParent = s->actionForm;
         s->action = GetDlgItem(s->actionForm, ID_ACTION);
@@ -2348,7 +2494,13 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         s->runIn = GetDlgItem(s->executeForm, ID_RUN_IN);
         fillRunIn(*s, L"output_pane");
         s->controlParent = hwnd;
+        resizeControlBy(hwnd, 93, 0);
+        resizeControlBy(s->tab, 93, 0);
+        resizeControlBy(s->tree, 93, -1);
+        offsetControlX(GetDlgItem(hwnd, ID_HEADER), 93);
+        centerChildHorizontally(hwnd, s->saveButton);
         layoutPageForms(*s);
+        layoutPathsInfo(*s);
         bindItemForm(*s, nullptr);
         s->workspaceFolder = s->context.workspaceFolder;
         refreshSettingsPaths(*s);
@@ -2385,6 +2537,8 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         if (commitSelected(*s)) refreshSelectedTreeItemTitle(*s);
         return TRUE;
     }
+    if (message == WM_DRAWITEM &&
+        drawShortcutClear(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam), s->shortcutClearFont)) return TRUE;
     if (message == WM_DRAWITEM &&
         drawHelpLink(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) return TRUE;
     if (message == WM_DRAWITEM &&
@@ -2496,7 +2650,6 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
     }
     if (message == WM_CLOSE) { onCommand(*s, ID_CANCEL, BN_CLICKED); return TRUE; }
     if (message == WM_DESTROY) {
-        if (s->shortcutPlaceholderFont) { DeleteObject(s->shortcutPlaceholderFont); s->shortcutPlaceholderFont = nullptr; }
         if (s->shortcutClearFont) { DeleteObject(s->shortcutClearFont); s->shortcutClearFont = nullptr; }
         if (s->customIcon) { DestroyIcon(s->customIcon); s->customIcon = nullptr; }
         if (s->treeImages) {

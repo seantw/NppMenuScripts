@@ -319,6 +319,7 @@ static const std::wstring& tr(const char* key)
         {"ConfigInvalidJson", L"menu.json has an invalid or unsupported structure."},
         {"ConfigIconMissing", L"The toolbar icon is missing or invalid. Choose another icon or use the default icon. Changes were not saved."},
         {"ConfigSaveFailed", L"Unable to save menu.json."}, {"ConfigChooseIcon", L"Choose icon file..."},
+        {"ConfigChooseWindowsIcon", L"Choose Windows icon..."},
         {"ConfigRebuildFailed", L"menu.json was saved, but the menu could not be rebuilt. Fix the configuration and rebuild again."},
         {"ConfigNewMenuDefault", L"New Menu"}, {"ConfigNewSubmenuDefault", L"New Submenu"},
         {"ConfigNewItemDefault", L"New Item"},
@@ -4621,8 +4622,9 @@ static std::wstring scriptExtension(const std::wstring& path)
 
 static HBITMAP createToolbarBitmap(HICON icon)
 {
-    const int cx = GetSystemMetrics(SM_CXSMICON);
-    const int cy = GetSystemMetrics(SM_CYSMICON);
+    // Notepad++ uses the bitmap handle for its Standard small toolbar set.
+    const int cx = 16;
+    const int cy = 16;
     HDC screen = GetDC(nullptr);
     if (!screen) return nullptr;
     HBITMAP bitmap = CreateCompatibleBitmap(screen, cx, cy);
@@ -4644,13 +4646,45 @@ static HBITMAP createToolbarBitmap(HICON icon)
     return bitmap;
 }
 
+static bool splitIconLocation(const std::wstring& value, std::wstring& path, int& index)
+{
+    const size_t comma = value.find_last_of(L',');
+    if (comma == std::wstring::npos) { path = value; index = 0; return false; }
+    wchar_t* end = nullptr;
+    const long parsed = wcstol(value.c_str() + comma + 1, &end, 10);
+    if (!end || end == value.c_str() + comma + 1 || *end || parsed < INT_MIN || parsed > INT_MAX)
+        { path = value; index = 0; return false; }
+    path = value.substr(0, comma);
+    index = static_cast<int>(parsed);
+    return !path.empty();
+}
+
+static HICON loadIconLocation(const std::wstring& value, int cx = 32, int cy = 32)
+{
+    std::wstring path;
+    int index = 0;
+    const bool indexed = splitIconLocation(value, path, index);
+    if (!indexed)
+        return static_cast<HICON>(LoadImageW(nullptr, path.c_str(), IMAGE_ICON, cx, cy,
+                                             LR_LOADFROMFILE));
+    HICON large = nullptr, small = nullptr;
+    if (!ExtractIconExW(path.c_str(), index, &large, &small, 1)) return nullptr;
+    // Keep the high-resolution icon for Fluent toolbar modes. The separately
+    // supplied 16x16 bitmap covers the Standard small toolbar mode.
+    if (large) { if (small) DestroyIcon(small); return large; }
+    if (small) {
+        HICON resized = static_cast<HICON>(CopyImage(small, IMAGE_ICON, cx, cy, 0));
+        DestroyIcon(small);
+        return resized;
+    }
+    return nullptr;
+}
+
 static bool loadToolbarIcon(const std::wstring& path, toolbarIconsWithDarkMode& handles)
 {
     HICON icon = path.empty()
-        ? static_cast<HICON>(LoadImageW(g_hModule, MAKEINTRESOURCEW(101), IMAGE_ICON, 0, 0,
-                                        LR_DEFAULTSIZE))
-        : static_cast<HICON>(LoadImageW(nullptr, path.c_str(), IMAGE_ICON, 0, 0,
-                                        LR_LOADFROMFILE | LR_DEFAULTSIZE));
+        ? static_cast<HICON>(LoadImageW(g_hModule, MAKEINTRESOURCEW(101), IMAGE_ICON, 32, 32, 0))
+        : loadIconLocation(path);
     if (!icon) return false;
     HICON darkIcon = CopyIcon(icon);
     HBITMAP bitmap = createToolbarBitmap(icon);
@@ -4859,8 +4893,9 @@ static bool addJsonMenu(HMENU menu, cJSON* obj, const std::wstring& folder, unsi
                 if (childMenu) DestroyMenu(childMenu);
                 return false;
             }
+            const std::wstring submenuTitle = titleWithoutShortcut(utf8ToWide(titleItem->valuestring));
             if (!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(childMenu),
-                             utf8ToWide(titleItem->valuestring).c_str())) {
+                             submenuTitle.c_str())) {
                 DestroyMenu(childMenu);
                 return false;
             }
@@ -5163,14 +5198,29 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
             std::wstring iconPath;
             if (iconItem) {
                 const std::wstring iconName = utf8ToWide(iconItem->valuestring);
-                std::wstring lowerIcon = iconName;
-                std::transform(lowerIcon.begin(), lowerIcon.end(), lowerIcon.begin(), ::towlower);
-                if (lowerIcon.size() < 4 || lowerIcon.rfind(L".ico") != lowerIcon.size() - 4) {
-                    cJSON_Delete(root);
-                    MessageBoxW(g_nppData._nppHandle, tr("InvalidToolbarIcon").c_str(), L"NppMenuScripts", MB_OK | MB_ICONERROR);
-                    return false;
+                std::wstring resourcePath;
+                int resourceIndex = 0;
+                const bool indexed = splitIconLocation(iconName, resourcePath, resourceIndex);
+                if (indexed) {
+                    const std::wstring resolved = joinPath(resolvedIconFolder, resourcePath);
+                    iconPath = resolved + L"," + std::to_wstring(resourceIndex);
+                    HICON iconCheck = loadIconLocation(iconPath);
+                    if (!iconCheck) {
+                        cJSON_Delete(root);
+                        MessageBoxW(g_nppData._nppHandle, tr("InvalidToolbarIcon").c_str(), L"NppMenuScripts", MB_OK | MB_ICONERROR);
+                        return false;
+                    }
+                    DestroyIcon(iconCheck);
+                } else {
+                    std::wstring lowerIcon = iconName;
+                    std::transform(lowerIcon.begin(), lowerIcon.end(), lowerIcon.begin(), ::towlower);
+                    if (lowerIcon.size() < 4 || lowerIcon.rfind(L".ico") != lowerIcon.size() - 4) {
+                        cJSON_Delete(root);
+                        MessageBoxW(g_nppData._nppHandle, tr("InvalidToolbarIcon").c_str(), L"NppMenuScripts", MB_OK | MB_ICONERROR);
+                        return false;
+                    }
+                    iconPath = joinPath(resolvedIconFolder, iconName);
                 }
-                iconPath = joinPath(resolvedIconFolder, iconName);
             }
             configuredToolbarScripts.push_back(script);
             configuredToolbarActions.push_back(action);
@@ -5240,7 +5290,7 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
         if (!sub || !addJsonMenu(sub, top, folder)) {
             if (sub) DestroyMenu(sub); cJSON_Delete(root); removeMenus(); return false;
         }
-        const std::wstring title = utf8ToWide(top->string);
+        const std::wstring title = titleWithoutShortcut(utf8ToWide(top->string));
         const BOOL inserted = helpMenuPosition >= 0
             ? InsertMenuW(g_mainMenu, static_cast<UINT>(helpMenuPosition),
                           MF_BYPOSITION | MF_POPUP, reinterpret_cast<UINT_PTR>(sub), title.c_str())

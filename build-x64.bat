@@ -40,7 +40,7 @@ g++ -m64 -std=c++17 -Oz -ffunction-sections -fdata-sections -s -shared -static -
   -Isrc -Ithird_party ^
   src/main.cpp src/MenuConfigEditor.cpp third_party/cJSON.c build/resource.o %CRT_FP10_ARG% ^
   -o build/NppMenuScripts.dll ^
-  -Wl,--gc-sections -luser32 -lgdi32 -lkernel32 -lcomdlg32 -lcomctl32 -lshell32 -lole32
+  -Wl,--gc-sections -luser32 -lgdi32 -lkernel32 -lcomdlg32 -lcomctl32 -lshell32 -lole32 -luxtheme
 
 if errorlevel 1 exit /b %errorlevel%
 

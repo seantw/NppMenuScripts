@@ -107,6 +107,7 @@ If you change `script_folder`, copy `menu-helper.js` and `package.json` to its p
     - `action`: A built-in plugin action or Notepad++ menu command. The available actions are:
       - `"RUN_CURRENT_FILE"` runs the script currently open in the editor.
       - `"STOP_SCRIPT"` stops the running script.
+      - `"CONFIGURE_MENU"` opens the NppMenuScripts menu configuration window.
       - `"MENU:..."` runs a Notepad++ menu command. Use an [Item ID](https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/english.xml) or a menu path in the current UI language. For example, `"MENU: 41001"` or `"MENU: File/New"`.
     - `execute`: An object with the following properties:
       - `command` (required): The command line to run.
@@ -117,7 +118,7 @@ If you change `script_folder`, copy `menu-helper.js` and `package.json` to its p
       - `save_before_run`: `true` or `false`. Saves the active document before running.
       - `code_page`: A string or number. Sets the code page for the Windows Console or the text encoding used to parse Output Pane output. The default is `ANSI`. Common values include `ANSI`, `UTF-8`, and `UTF-16LE`; you can also specify a [Windows code page identifier](https://learn.microsoft.com/en-us/windows/win32/intl/code-page-identifiers).
       - `env`: Environment variables added when running the command.
-      - The `command` and `env` values can use the following placeholders:
+      - <a id="command-env-placeholders"></a>The `command` and `env` values can use the following placeholders:
         - `{FILE_PATH}`: Full file path
         - `{FILE_NAME}`: File name, including extension
         - `{FILE_DIR}`: Folder containing the file

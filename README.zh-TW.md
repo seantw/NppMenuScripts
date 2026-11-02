@@ -110,6 +110,7 @@ Notepad++\
     - `action` 值為字串，可設定外掛內建動作或 Notepad++ 選單指令。目前有三種：
       - `"RUN_CURRENT_FILE"` 代表執行目前編輯中的腳本。
       - `"STOP_SCRIPT"` 代表停止執行中的腳本。
+      - `"CONFIGURE_MENU"` 開啟 NppMenuScripts 的選單設定視窗。
       - `"MENU:..."` 執行 Notepad++ 選單。可使用 [Item ID](https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/taiwaneseMandarin.xml) 或目前語系「選單路徑字串」。例如 `"MENU: 41001"` 或 `"MENU: 檔案/新增"`。
     - `execute` 物件。屬性如下：
       - `command`：字串(必要)，命令列指令。
@@ -120,7 +121,7 @@ Notepad++\
       - `save_before_run`：true/false。執行前自動儲存目前文件。
       - `code_page`：字串或數字。用於 Windows 終端機 (Console) 的字碼頁，或解析「輸出面板」的文字編碼。若未指定，預設為 `ANSI`。常見的有 `ANSI`、`UTF-8`、`UTF-16LE`，或直接指定[代碼頁編號](https://learn.microsoft.com/zh-tw/windows/win32/intl/code-page-identifiers)數字。
       - `env`：執行時附加的環境變數。
-      - 上述中的 `command` 及 `env` 可帶入下列變數：
+      - <a id="command-env-placeholders"></a>上述中的 `command` 及 `env` 可帶入下列變數：
         - `{FILE_PATH}`：完整路徑檔名
         - `{FILE_NAME}`：檔名 (含副檔名)
         - `{FILE_DIR}`：文件所在路徑
