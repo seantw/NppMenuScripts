@@ -162,6 +162,13 @@ static std::mutex g_processHandleMutex;
 static HANDLE g_processHandle = nullptr;
 static HANDLE g_processJob = nullptr;
 static std::atomic<bool> g_stopRequested{false};
+struct DialogWorker {
+    std::thread thread;
+    std::atomic<DWORD> threadId{0};
+    std::atomic<bool> finished{false};
+};
+static std::mutex g_dialogWorkersMutex;
+static std::vector<std::shared_ptr<DialogWorker>> g_dialogWorkers;
 static constexpr UINT WM_NPPMENUSCRIPTS_OUTPUT = WM_APP + 101;
 static constexpr UINT WM_NPPMENUSCRIPTS_RUNSTATE = WM_APP + 102;
 static constexpr UINT WM_NPPMENUSCRIPTS_PROTOCOL = WM_APP + 103;
@@ -184,6 +191,76 @@ struct RunStatePayload {
     bool showStopNotification = false;
     bool updateOutputCaret = true;
 };
+
+static void reapDialogWorkersLocked()
+{
+    auto worker = g_dialogWorkers.begin();
+    while (worker != g_dialogWorkers.end()) {
+        if ((*worker)->finished.load(std::memory_order_acquire)) {
+            if ((*worker)->thread.joinable()) (*worker)->thread.join();
+            worker = g_dialogWorkers.erase(worker);
+        } else {
+            ++worker;
+        }
+    }
+}
+
+static bool launchDialogWorker(std::function<void()> work)
+{
+    if (g_shuttingDown.load()) return false;
+
+    std::lock_guard<std::mutex> lock(g_dialogWorkersMutex);
+    reapDialogWorkersLocked();
+    if (g_shuttingDown.load()) return false;
+
+    std::shared_ptr<DialogWorker> worker;
+    try {
+        worker = std::make_shared<DialogWorker>();
+        g_dialogWorkers.push_back(worker);
+        worker->thread = std::thread([worker, work = std::move(work)]() mutable {
+            worker->threadId.store(GetCurrentThreadId(), std::memory_order_release);
+            try {
+                work();
+            } catch (...) {
+                try { debugLog(L"A dialog worker ended with an exception"); } catch (...) {}
+            }
+            worker->finished.store(true, std::memory_order_release);
+        });
+    } catch (...) {
+        if (worker && !g_dialogWorkers.empty() && g_dialogWorkers.back() == worker)
+            g_dialogWorkers.pop_back();
+        return false;
+    }
+    return true;
+}
+
+static BOOL CALLBACK closeDialogWorkerWindow(HWND hwnd, LPARAM)
+{
+    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    return TRUE;
+}
+
+static void shutdownDialogWorkers()
+{
+    std::vector<std::shared_ptr<DialogWorker>> workers;
+    {
+        std::lock_guard<std::mutex> lock(g_dialogWorkersMutex);
+        workers.swap(g_dialogWorkers);
+    }
+
+    for (const auto& worker : workers) {
+        const DWORD threadId = worker->threadId.load(std::memory_order_acquire);
+        if (threadId) EnumThreadWindows(threadId, closeDialogWorkerWindow, 0);
+    }
+    for (const auto& worker : workers) {
+        while (!worker->finished.load(std::memory_order_acquire)) {
+            const DWORD threadId = worker->threadId.load(std::memory_order_acquire);
+            if (threadId) EnumThreadWindows(threadId, closeDialogWorkerWindow, 0);
+            Sleep(10);
+        }
+        if (worker->thread.joinable()) worker->thread.join();
+    }
+}
 
 static LRESULT CALLBACK hotkeyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static bool createHotkeyWindow();
@@ -299,9 +376,7 @@ static const std::wstring& tr(const char* key)
         {"ConfigSubmenuSettings", L"Submenu Settings"}, {"ConfigItemSettings", L"Item Settings"},
         {"ConfigScriptFile", L"Script file"}, {"ConfigBrowse", L"Browse..."}, {"ConfigEditScript", L"Edit"},
         {"ConfigScriptFileMissing", L"The selected script file does not exist."}, {"ConfigAction", L"Action"},
-        {"ConfigMenuPathOrId", L"Menu path or Item ID"},
-        {"ConfigMenuPathHint", L"Enter an Item ID or a menu path in the current UI language."},
-        {"ConfigFindMenuIds", L"Find menu IDs"}, {"ConfigCommand", L"Command"},
+        {"ConfigMenuPathOrId", L"Menu path or ID"}, {"ConfigCommand", L"Command"},
         {"ConfigSaveBeforeRun", L"Save current file before running"}, {"ConfigRunIn", L"Run in"},
         {"ConfigCodePage", L"Code page"}, {"ConfigEnvironment", L"Environment variables"},
         {"ConfigAddOrUpdate", L"Add / Update"}, {"ConfigRemove", L"Remove"}, {"ConfigSeparator", L"Separator"},
@@ -2480,11 +2555,7 @@ static bool handleConfirmProtocolLine(const std::string& line)
                      L" bytes=" + std::to_wstring(written));
         }
     };
-    try {
-        std::thread(showAndRespond).detach();
-    } catch (...) {
-        showAndRespond();
-    }
+    if (!launchDialogWorker(showAndRespond) && !g_shuttingDown.load()) showAndRespond();
     return true;
 }
 
@@ -2534,11 +2605,7 @@ static bool handlePromptProtocolLine(const std::string& line)
                      L" bytes=" + std::to_wstring(written));
         }
     };
-    try {
-        std::thread(showAndRespond).detach();
-    } catch (...) {
-        showAndRespond();
-    }
+    if (!launchDialogWorker(showAndRespond) && !g_shuttingDown.load()) showAndRespond();
     return true;
 }
 
@@ -3421,12 +3488,7 @@ static bool handleProtocolLine(const std::string& line)
                      L" bytes=" + std::to_wstring(written) + L" stdin kept open");
         }
     };
-    try {
-        std::thread(showAndRespond).detach();
-    } catch (...) {
-        // Preserve the alert behavior if the worker thread cannot be created.
-        showAndRespond();
-    }
+    if (!launchDialogWorker(showAndRespond) && !g_shuttingDown.load()) showAndRespond();
     return true;
 }
 
@@ -3628,6 +3690,7 @@ static void finishPipe(PipeReaderState& state,
 
 static void readPipes(HANDLE stdoutPipe, HANDLE stderrPipe,
                       const std::shared_ptr<std::atomic<bool>>& hadOutput,
+                      const std::shared_ptr<std::atomic<bool>>& rootProcessExited,
                       UINT codePage = CP_UTF8)
 {
     PipeReaderState streams[2];
@@ -3666,7 +3729,18 @@ static void readPipes(HANDLE stdoutPipe, HANDLE stderrPipe,
                 madeProgress = true;
                 continue;
             }
-            if (available == 0) continue;
+            if (available == 0) {
+                // Once the top-level process has exited, only drain bytes that
+                // were already written. Do not wait forever for a descendant
+                // that inherited one of the pipe handles.
+                if (rootProcessExited->load(std::memory_order_acquire)) {
+                    CloseHandle(state.pipe);
+                    state.pipe = nullptr;
+                    state.open = false;
+                    madeProgress = true;
+                }
+                continue;
+            }
 
             DWORD bytesRead = 0;
             const DWORD requestSize = std::min<DWORD>(available, sizeof(buffer));
@@ -4264,11 +4338,24 @@ static void runNodeScript(const std::wstring& path, const std::wstring& menuTitl
             return;
         }
         auto hadOutput = std::make_shared<std::atomic<bool>>(false);
+        auto rootProcessExited = std::make_shared<std::atomic<bool>>(false);
         std::thread outputThread;
         if (captureOutput)
-            outputThread = std::thread(readPipes, outRead, errRead, hadOutput,
+            outputThread = std::thread(readPipes, outRead, errRead, hadOutput, rootProcessExited,
                                        isExternal ? executeOptions.codePage : CP_UTF8);
         WaitForSingleObject(pi.hProcess, INFINITE);
+        {
+            std::lock_guard<std::mutex> lock(g_processHandleMutex);
+            if (g_processHandle == pi.hProcess) g_processHandle = nullptr;
+            if (g_processJob == processJob) g_processJob = nullptr;
+            if (processJob) {
+                // The script process is done. Closing the kill-on-close job
+                // now also ends any child that still holds stdout/stderr open.
+                CloseHandle(processJob);
+                processJob = nullptr;
+            }
+        }
+        rootProcessExited->store(true, std::memory_order_release);
         if (outputThread.joinable()) outputThread.join();
         {
             std::lock_guard<std::mutex> lock(g_stdinMutex);
@@ -4277,16 +4364,10 @@ static void runNodeScript(const std::wstring& path, const std::wstring& menuTitl
                 g_stdinWrite = nullptr;
             }
         }
-        {
-            std::lock_guard<std::mutex> lock(g_processHandleMutex);
-            if (g_processHandle == pi.hProcess) g_processHandle = nullptr;
-            if (g_processJob == processJob) g_processJob = nullptr;
-        }
         CloseHandle(pi.hThread);
         DWORD exitCode = 1;
         GetExitCodeProcess(pi.hProcess, &exitCode);
         CloseHandle(pi.hProcess);
-        if (processJob) CloseHandle(processJob);
         debugLog(L"process finished exitCode=" + std::to_wstring(exitCode) +
                  L" hadOutput=" + std::to_wstring(hadOutput->load()));
         const ScriptExitState exitState = classifyScriptExit(
@@ -5444,6 +5525,7 @@ extern "C" __declspec(dllexport) void beNotified(SCNotification* notifyCode)
         if (g_processThread.joinable()) {
             g_processThread.join();
         }
+        shutdownDialogWorkers();
         removeMenus();
         destroyOutputPane();
     }

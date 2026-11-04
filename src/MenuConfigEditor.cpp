@@ -67,6 +67,7 @@ struct EditorState {
     HWND shortcutLabel = nullptr;
     HWND shortcut = nullptr;
     HWND shortcutClear = nullptr;
+    HWND shortcutClearHovered = nullptr;
     HWND icon = nullptr;
     HWND scriptLabel = nullptr;
     HWND script = nullptr;
@@ -76,7 +77,6 @@ struct EditorState {
     HWND action = nullptr;
     HWND actionTargetLabel = nullptr;
     HWND actionTarget = nullptr;
-    HWND actionHint = nullptr;
     HWND actionHelp = nullptr;
     HWND commandLabel = nullptr;
     HWND command = nullptr;
@@ -86,6 +86,7 @@ struct EditorState {
     HWND runIn = nullptr;
     HWND codePageLabel = nullptr;
     HWND codePage = nullptr;
+    HWND codePageHelp = nullptr;
     HWND envLabel = nullptr;
     HWND envList = nullptr;
     HWND envHelp = nullptr;
@@ -116,6 +117,7 @@ struct EditorState {
     HWND iconFolderSet = nullptr;
     HWND iconFolderOpen = nullptr;
     HWND saveButton = nullptr;
+    HWND shortcutTooltip = nullptr;
     HFONT font = nullptr;
     HFONT shortcutClearFont = nullptr;
     HICON customIcon = nullptr;
@@ -181,6 +183,41 @@ static std::wstring fromUtf8(const char* value)
     MultiByteToWideChar(CP_UTF8, 0, value, -1, result.data(), length);
     result.resize(wcslen(result.c_str()));
     return result;
+}
+
+static std::wstring nativeLanguageXmlUrl(HWND npp)
+{
+    std::string filename = "english.xml";
+    if (npp) {
+        const LRESULT needed = SendMessageW(npp, NPPM_GETNATIVELANGFILENAME, 0, 0);
+        if (needed > 0 && needed <= 1024) {
+            std::vector<char> buffer(static_cast<size_t>(needed) + 1, '\0');
+            const LRESULT copied = SendMessageW(npp, NPPM_GETNATIVELANGFILENAME,
+                static_cast<WPARAM>(buffer.size()), reinterpret_cast<LPARAM>(buffer.data()));
+            if (copied > 0 && copied <= needed) {
+                filename.assign(buffer.data(), static_cast<size_t>(copied));
+                const size_t separator = filename.find_last_of("/\\");
+                if (separator != std::string::npos) filename.erase(0, separator + 1);
+                if (filename.find_last_of('.') == std::string::npos) filename += ".xml";
+                if (filename.empty()) filename = "english.xml";
+            }
+        }
+    }
+
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string escaped;
+    for (unsigned char ch : filename) {
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+            escaped.push_back(static_cast<char>(ch));
+        } else {
+            escaped.push_back('%');
+            escaped.push_back(hex[ch >> 4]);
+            escaped.push_back(hex[ch & 0x0F]);
+        }
+    }
+    return L"https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/" +
+        fromUtf8(escaped.c_str());
 }
 
 static bool isAbsolute(const std::wstring& path)
@@ -457,60 +494,11 @@ static void showChildDialogAndRepaint(HWND parent, HWND child)
     UpdateWindow(child);
 }
 
-static void offsetControlY(HWND hwnd, int pixels)
+static void setEditTextMargins(HWND hwnd, int left = 3, int right = 3)
 {
     if (!hwnd) return;
-    RECT rect{};
-    if (!GetWindowRect(hwnd, &rect)) return;
-    POINT origin{rect.left, rect.top};
-    HWND parent = GetParent(hwnd);
-    if (!parent || !MapWindowPoints(nullptr, parent, &origin, 1)) {
-        if (!parent) return;
-    }
-    SetWindowPos(hwnd, nullptr, origin.x, origin.y + pixels, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
-static void offsetControlX(HWND hwnd, int pixels)
-{
-    if (!hwnd) return;
-    RECT rect{};
-    if (!GetWindowRect(hwnd, &rect)) return;
-    POINT origin{rect.left, rect.top};
-    HWND parent = GetParent(hwnd);
-    if (!parent || !MapWindowPoints(nullptr, parent, &origin, 1)) {
-        if (!parent) return;
-    }
-    SetWindowPos(hwnd, nullptr, origin.x + pixels, origin.y, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
-static void resizeControlBy(HWND hwnd, int widthDelta, int heightDelta)
-{
-    if (!hwnd) return;
-    RECT rect{};
-    if (!GetWindowRect(hwnd, &rect)) return;
-    SetWindowPos(hwnd, nullptr, 0, 0,
-                 rect.right - rect.left + widthDelta,
-                 rect.bottom - rect.top + heightDelta,
-                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
-static void centerChildHorizontally(HWND parent, HWND child)
-{
-    if (!parent || !child) return;
-    RECT parentRect{}, childRect{};
-    if (!GetClientRect(parent, &parentRect) || !GetWindowRect(child, &childRect)) return;
-    MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&childRect), 2);
-    const int width = childRect.right - childRect.left;
-    SetWindowPos(child, nullptr, (parentRect.right - width) / 2, childRect.top,
-                 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
-static void setEditTextMargins(HWND hwnd)
-{
-    if (!hwnd) return;
-    SendMessageW(hwnd, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(3, 3));
+    SendMessageW(hwnd, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                 MAKELONG(left, right));
 }
 
 static void showShortcutClear(HWND edit, HWND clearButton, bool visible)
@@ -546,7 +534,7 @@ static void setMultilineTextOrigin(HWND hwnd, int left, int top)
     rect.top = std::max<LONG>(0, rect.top - borderY + top);
     rect.right = std::max<LONG>(rect.left + 1, rect.right - borderX);
     rect.bottom = std::max<LONG>(rect.top + 1, rect.bottom - borderY);
-    SendMessageW(hwnd, EM_SETRECT, 0, reinterpret_cast<LPARAM>(&rect));
+    SendMessageW(hwnd, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&rect));
 }
 
 static EditorNode* makeNode(EditorState& s, NodeKind kind, cJSON* value, cJSON* parent,
@@ -574,11 +562,14 @@ static HTREEITEM insertTreeNode(EditorState& s, HTREEITEM parent, const std::wst
     if (node) {
         int image = -1;
         switch (node->kind) {
+        case NodeKind::MenuRoot: image = 5; break;
+        case NodeKind::ToolbarRoot: image = 6; break;
         case NodeKind::TopMenu:
         case NodeKind::Submenu: image = 0; break;
         case NodeKind::Script: image = 1; break;
         case NodeKind::Action: image = 2; break;
         case NodeKind::Execute: image = 3; break;
+        case NodeKind::Separator: image = 4; break;
         default: break;
         }
         if (image >= 0 && s.treeImages) {
@@ -593,11 +584,13 @@ static HTREEITEM insertTreeNode(EditorState& s, HTREEITEM parent, const std::wst
 static void initializeTreeImages(EditorState& s)
 {
     const int size = std::max(16, GetSystemMetrics(SM_CXSMICON));
-    HIMAGELIST images = ImageList_Create(size, size, ILC_COLOR32 | ILC_MASK, 4, 0);
+    HIMAGELIST images = ImageList_Create(size, size, ILC_COLOR32 | ILC_MASK, 7, 0);
     if (!images) return;
     const int resources[] = {
         IDR_TREE_FOLDER_ICON, IDR_TREE_SCRIPT_ICON,
-        IDR_TREE_ACTION_ICON, IDR_TREE_COMMAND_ICON
+        IDR_TREE_ACTION_ICON, IDR_TREE_COMMAND_ICON,
+        IDR_TREE_SEPARATOR_ICON,
+        IDR_TREE_MENU_ICON, IDR_TREE_TOOLBAR_ICON
     };
     bool complete = true;
     for (int resource : resources) {
@@ -1201,11 +1194,13 @@ static void bindItemForm(EditorState& s, EditorNode* node)
     s.scriptBrowse = get(ID_SCRIPT_BROWSE); s.scriptEdit = get(ID_SCRIPT_EDIT);
     s.actionLabel = get(ID_ACTION_LABEL); s.action = get(ID_ACTION);
     s.actionTargetLabel = get(ID_ACTION_TARGET_LABEL); s.actionTarget = get(ID_ACTION_TARGET);
-    s.actionHint = get(ID_ACTION_HINT); s.actionHelp = get(ID_ACTION_HELP);
+    s.actionHelp = get(ID_ACTION_HELP);
+    if (s.actionHelp) SetWindowSubclass(s.actionHelp, helpLinkSubclass, 1, reinterpret_cast<DWORD_PTR>(&s));
     s.commandLabel = get(ID_COMMAND_LABEL); s.command = get(ID_COMMAND);
     s.commandHelp = get(ID_COMMAND_HELP); s.saveBeforeRun = get(ID_SAVE_BEFORE_RUN);
     s.runInLabel = get(ID_RUN_IN_LABEL); s.runIn = get(ID_RUN_IN);
     s.codePageLabel = get(ID_CODE_PAGE_LABEL); s.codePage = get(ID_CODE_PAGE);
+    s.codePageHelp = get(ID_CODE_PAGE_HELP);
     s.envLabel = get(ID_ENV_LABEL); s.envList = get(ID_ENV_LIST); s.envHelp = get(ID_ENV_HELP);
     s.info = get(ID_INFO);
 
@@ -1213,6 +1208,7 @@ static void bindItemForm(EditorState& s, EditorNode* node)
         SetWindowSubclass(s.shortcut, shortcutSubclass, 1, reinterpret_cast<DWORD_PTR>(&s));
     }
     if (s.commandHelp) SetWindowSubclass(s.commandHelp, helpLinkSubclass, 1, reinterpret_cast<DWORD_PTR>(&s));
+    if (s.codePageHelp) SetWindowSubclass(s.codePageHelp, helpLinkSubclass, 1, reinterpret_cast<DWORD_PTR>(&s));
     if (s.envHelp) SetWindowSubclass(s.envHelp, helpLinkSubclass, 1, reinterpret_cast<DWORD_PTR>(&s));
 
     for (HWND combo : {s.action, s.runIn, s.codePage}) if (combo) {
@@ -1244,11 +1240,20 @@ static void showTypeControls(EditorState& s, NodeKind kind, bool hasItem)
 
 static void showActionTargetControls(EditorState& s, bool visible)
 {
-    show(s.actionTargetLabel, visible);
-    show(s.actionTarget, visible);
-    show(s.actionHint, visible);
-    show(s.actionHelp, visible);
+    HWND form = s.actionTargetLabel ? GetParent(s.actionTargetLabel) : nullptr;
+    if (!visible && s.actionTarget) SetWindowTextW(s.actionTarget, L"");
+    for (HWND control : {s.actionTargetLabel, s.actionTarget, s.actionHelp}) {
+        if (!control) continue;
+        ShowWindow(control, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+    }
     EnableWindow(s.actionTarget, visible);
+    if (form && s.activeItemForm == form) {
+        // Tab/item changes hide the child page before the host background is
+        // repainted. Mirror that sequence here so transparent static labels
+        // and edit borders cannot leave stale pixels when the menu-path row hides.
+        ShowWindow(form, SW_HIDE);
+        showChildDialogAndRepaint(s.hwnd, form);
+    }
 }
 
 static void loadSelected(EditorState& s, EditorNode* node)
@@ -1872,27 +1877,28 @@ static LRESULT CALLBACK shortcutSubclass(HWND hwnd, UINT message, WPARAM wParam,
     return DefSubclassProc(hwnd, message, wParam, lParam);
 }
 
+static LRESULT CALLBACK shortcutClearHoverSubclass(HWND hwnd, UINT message, WPARAM wParam,
+                                                   LPARAM lParam, UINT_PTR, DWORD_PTR data)
+{
+    auto* state = reinterpret_cast<EditorState*>(data);
+    if (message == WM_MOUSEMOVE && state && state->shortcutClearHovered != hwnd) {
+        TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, hwnd, 0};
+        TrackMouseEvent(&tracking);
+        state->shortcutClearHovered = hwnd;
+        InvalidateRect(hwnd, nullptr, FALSE);
+    } else if (message == WM_MOUSELEAVE && state && state->shortcutClearHovered == hwnd) {
+        state->shortcutClearHovered = nullptr;
+        InvalidateRect(hwnd, nullptr, FALSE);
+    } else if (message == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, shortcutClearHoverSubclass, 2);
+    }
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
 static LRESULT CALLBACK helpLinkSubclass(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
                                          UINT_PTR subclassId, DWORD_PTR data)
 {
-    auto* state = reinterpret_cast<EditorState*>(data);
-    if (message == WM_PAINT && state) {
-        PAINTSTRUCT paint{};
-        HDC dc = BeginPaint(hwnd, &paint);
-        if (dc) {
-            RECT rect{};
-            if (GetClientRect(hwnd, &rect)) {
-                HGDIOBJ oldFont = state->font ? SelectObject(dc, state->font) : nullptr;
-                SetBkMode(dc, TRANSPARENT);
-                SetTextColor(dc, GetSysColor(COLOR_HOTLIGHT));
-                DrawTextW(dc, L"(?)", 3, &rect,
-                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                if (oldFont) SelectObject(dc, oldFont);
-            }
-            EndPaint(hwnd, &paint);
-        }
-        return 0;
-    }
+    (void)data;
     if (message == WM_SETCURSOR) {
         SetCursor(LoadCursor(nullptr, IDC_HAND));
         return TRUE;
@@ -2002,6 +2008,9 @@ static void onCommand(EditorState& s, int id, int notification)
 {
     if (id == ID_SHORTCUT_CLEAR && notification == BN_CLICKED) {
         SetWindowTextW(s.shortcut, L"");
+        // The clear button can own focus after a mouse click. Move focus back
+        // to the shortcut field before hiding it, or Windows may focus the title edit.
+        if (s.shortcut) SetFocus(s.shortcut);
         showShortcutClear(s.shortcut, s.shortcutClear, false);
         s.dirty = true;
         PostMessageW(s.hwnd, TITLE_REFRESH_MESSAGE, 0, 0);
@@ -2143,7 +2152,7 @@ static bool drawComboItem(const DRAWITEMSTRUCT& draw)
     return true;
 }
 
-static bool drawShortcutClear(const DRAWITEMSTRUCT& draw, HFONT font)
+static bool drawShortcutClear(const DRAWITEMSTRUCT& draw, HFONT font, HWND hoveredButton)
 {
     if (draw.CtlType != ODT_BUTTON || draw.CtlID != ID_SHORTCUT_CLEAR) return false;
 
@@ -2151,7 +2160,10 @@ static bool drawShortcutClear(const DRAWITEMSTRUCT& draw, HFONT font)
     // the background. Use the familiar multiplication-sign close glyph.
     const int saved = SaveDC(draw.hDC);
     SetBkMode(draw.hDC, TRANSPARENT);
-    SetTextColor(draw.hDC, GetSysColor((draw.itemState & ODS_DISABLED) ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT));
+    const COLORREF color = (draw.itemState & ODS_DISABLED)
+        ? GetSysColor(COLOR_GRAYTEXT)
+        : (hoveredButton == draw.hwndItem ? GetSysColor(COLOR_WINDOWTEXT) : RGB(160, 160, 160));
+    SetTextColor(draw.hDC, color);
     HGDIOBJ oldFont = font ? SelectObject(draw.hDC, font) : nullptr;
     RECT textRect = draw.rcItem;
     DrawTextW(draw.hDC, L"×", 1, &textRect,
@@ -2164,16 +2176,20 @@ static bool drawShortcutClear(const DRAWITEMSTRUCT& draw, HFONT font)
 static bool drawHelpLink(const DRAWITEMSTRUCT& draw)
 {
     if (draw.CtlType != ODT_BUTTON ||
-        (draw.CtlID != ID_COMMAND_HELP && draw.CtlID != ID_ENV_HELP)) return false;
-    // Leave the button background untouched so the page background shows through.
+        (draw.CtlID != ID_ACTION_HELP && draw.CtlID != ID_COMMAND_HELP && draw.CtlID != ID_ENV_HELP &&
+         draw.CtlID != ID_CODE_PAGE_HELP)) return false;
+    const int saved = SaveDC(draw.hDC);
+    // Owner-draw is the single paint path for this link. Leave the background
+    // untouched so the tab page surface shows through behind the text.
     HFONT font = reinterpret_cast<HFONT>(SendMessageW(draw.hwndItem, WM_GETFONT, 0, 0));
     HGDIOBJ oldFont = font ? SelectObject(draw.hDC, font) : nullptr;
     SetBkMode(draw.hDC, TRANSPARENT);
-    SetTextColor(draw.hDC, GetSysColor(COLOR_HOTLIGHT));
+    SetTextColor(draw.hDC, GetSysColor((draw.itemState & ODS_DISABLED) ? COLOR_GRAYTEXT : COLOR_HOTLIGHT));
     RECT textRect = draw.rcItem;
     DrawTextW(draw.hDC, L"(?)", 3, &textRect,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     if (oldFont) SelectObject(draw.hDC, oldFont);
+    if (saved) RestoreDC(draw.hDC, saved);
     return true;
 }
 
@@ -2204,7 +2220,6 @@ static void positionHelpLink(EditorState& s, HWND label, HWND field, HWND link)
         y = labelRect.bottom + 1;
     }
     x -= 2;
-    y -= 5;
     SetWindowPos(link, nullptr, x, y, linkWidth, linkHeight,
                  SWP_NOZORDER | SWP_NOACTIVATE);
 }
@@ -2257,9 +2272,8 @@ static void layoutPageForm(EditorState& s, HWND form, const RECT& bounds, LONG c
         children.push_back({child, rect});
     }
 
-    // The dialog templates retain their original main-dialog coordinates.
-    // Place each page dialog in its real page rectangle, then translate its
-    // controls by the same origin so their visible positions do not change.
+    // Place each child dialog in its page rectangle and translate the template
+    // controls from their dialog coordinates into the child dialog's client area.
     SetWindowPos(form, HWND_TOP, bounds.left, bounds.top,
                  bounds.right - bounds.left, bounds.bottom - bounds.top,
                  SWP_NOACTIVATE | SWP_NOOWNERZORDER);
@@ -2306,12 +2320,9 @@ static void layoutPageForms(EditorState& s)
     const LONG pageBottom = settingsPage.bottom ? settingsPage.bottom : itemBottom;
     RECT itemRegion{std::max(itemLeft, pageLeft), std::max(itemTop, pageTop),
                     std::min(itemRight, pageRight), std::min(itemBottom, pageBottom)};
-    // The menu-item group and its controls move with the widened tree pane.
-    // The 93 px reference offset is the requested rendered-pixel change.
-    const LONG originalItemLeft = itemRegion.left - 93;
     for (HWND form : {s.emptyForm, s.scriptForm, s.actionForm, s.executeForm,
                       s.submenuForm, s.separatorForm})
-        layoutPageForm(s, form, itemRegion, originalItemLeft);
+        layoutPageForm(s, form, itemRegion, itemRegion.left);
     layoutPageForm(s, s.settingsForm, settingsPage, settingsPage.left);
 }
 
@@ -2355,16 +2366,14 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
 
         auto registerItemForm = [&](HWND form, int id, const std::wstring& label = L"") {
             s->controlParent = form;
-            control(*s, L"STATIC", label, 0, 0, 0, 0, 0, id);
+            HWND itemControl = control(*s, id == ID_SHORTCUT_CLEAR ? L"BUTTON" : L"STATIC",
+                                       label, 0, 0, 0, 0, 0, id);
+            if (id == ID_SHORTCUT_CLEAR && itemControl)
+                SetWindowSubclass(itemControl, shortcutClearHoverSubclass, 2,
+                                  reinterpret_cast<DWORD_PTR>(s));
         };
         auto registerHeader = [&](HWND form, const char* heading) {
             registerItemForm(form, ID_HEADER, tr(*s, heading));
-            HWND header = GetDlgItem(form, ID_HEADER);
-            RECT rect{};
-            if (header && GetWindowRect(header, &rect))
-                SetWindowPos(header, nullptr, 0, 0, rect.right - rect.left,
-                             rect.bottom - rect.top + 1,
-                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         };
         HWND layoutHeader = GetDlgItem(hwnd, ID_HEADER);
         if (layoutHeader) ShowWindow(layoutHeader, SW_HIDE);
@@ -2391,8 +2400,7 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
                 registerItemForm(form, ID_ACTION);
                 registerItemForm(form, ID_ACTION_TARGET_LABEL, tr(*s, "ConfigMenuPathOrId"));
                 registerItemForm(form, ID_ACTION_TARGET);
-                registerItemForm(form, ID_ACTION_HINT, tr(*s, "ConfigMenuPathHint"));
-                registerItemForm(form, ID_ACTION_HELP, tr(*s, "ConfigFindMenuIds"));
+                registerItemForm(form, ID_ACTION_HELP);
             } else if (form == s->executeForm) {
                 registerItemForm(form, ID_COMMAND_LABEL, tr(*s, "ConfigCommand"));
                 registerItemForm(form, ID_COMMAND);
@@ -2401,6 +2409,7 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
                 registerItemForm(form, ID_RUN_IN_LABEL, tr(*s, "ConfigRunIn"));
                 registerItemForm(form, ID_RUN_IN);
                 registerItemForm(form, ID_CODE_PAGE_LABEL, tr(*s, "ConfigCodePage"));
+                registerItemForm(form, ID_CODE_PAGE_HELP);
                 registerItemForm(form, ID_CODE_PAGE);
                 registerItemForm(form, ID_ENV_LABEL, tr(*s, "ConfigEnvironment"));
                 registerItemForm(form, ID_ENV_LIST);
@@ -2408,11 +2417,22 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
             }
         }
         s->shortcutHintText = tr(*s, "ConfigShortcutHint");
+        s->shortcutTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                              WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                              CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                              hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
         for (HWND form : {s->scriptForm, s->actionForm, s->executeForm, s->submenuForm}) {
             HWND shortcut = GetDlgItem(form, ID_SHORTCUT);
-            if (shortcut)
-                SendMessageW(shortcut, EM_SETCUEBANNER, TRUE,
-                             reinterpret_cast<LPARAM>(s->shortcutHintText.c_str()));
+            if (shortcut && s->shortcutTooltip) {
+                TOOLINFOW tool{};
+                tool.cbSize = sizeof(tool);
+                tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+                tool.hwnd = form;
+                tool.uId = reinterpret_cast<UINT_PTR>(shortcut);
+                tool.lpszText = const_cast<LPWSTR>(s->shortcutHintText.c_str());
+                SendMessageW(s->shortcutTooltip, TTM_ADDTOOLW, 0,
+                             reinterpret_cast<LPARAM>(&tool));
+            }
             show(GetDlgItem(form, ID_SHORTCUT_CLEAR), false);
         }
         const std::wstring envPlaceholder = tr(*s, "ConfigEnvironmentPlaceholder");
@@ -2448,40 +2468,30 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         s->workspaceFolder = s->context.workspaceFolder;
         refreshSettingsPaths(*s);
 
-        for (HWND form : {s->emptyForm, s->scriptForm, s->actionForm, s->executeForm,
-                          s->submenuForm, s->separatorForm}) {
-            for (int id : {ID_TITLE_LABEL, ID_TITLE, ID_SHORTCUT_LABEL, ID_SHORTCUT,
-                           ID_SHORTCUT_CLEAR, ID_ICON,
-                           ID_SCRIPT_LABEL, ID_SCRIPT, ID_SCRIPT_BROWSE, ID_SCRIPT_EDIT,
-                           ID_ACTION_LABEL, ID_ACTION, ID_ACTION_TARGET_LABEL, ID_ACTION_TARGET,
-                           ID_ACTION_HINT, ID_ACTION_HELP, ID_COMMAND_LABEL, ID_COMMAND, ID_COMMAND_HELP,
-                           ID_SAVE_BEFORE_RUN, ID_RUN_IN_LABEL, ID_RUN_IN, ID_CODE_PAGE_LABEL,
-                           ID_CODE_PAGE, ID_ENV_LABEL, ID_ENV_LIST, ID_ENV_HELP, ID_INFO})
-                offsetControlY(GetDlgItem(form, id), 2);
-        }
-
-        // These fields were measured one pixel too high. Keep labels and the
-        // other rows fixed, and move only the affected input controls.
-        for (HWND form : {s->scriptForm, s->submenuForm, s->actionForm, s->executeForm}) {
-            offsetControlY(GetDlgItem(form, ID_TITLE), 1);
-            offsetControlY(GetDlgItem(form, ID_SHORTCUT), 1);
-            offsetControlY(GetDlgItem(form, ID_SHORTCUT_CLEAR), 1);
-            offsetControlX(GetDlgItem(form, ID_SHORTCUT_CLEAR), 4);
-        }
-        offsetControlY(GetDlgItem(s->executeForm, ID_CODE_PAGE), 1);
-
         // Keep horizontal text margins consistent across standard EDIT fields.
         for (HWND form : {s->scriptForm, s->actionForm, s->executeForm, s->submenuForm}) {
-            setEditTextMargins(GetDlgItem(form, ID_TITLE));
-            setEditTextMargins(GetDlgItem(form, ID_SHORTCUT));
+            setEditTextMargins(GetDlgItem(form, ID_TITLE), 0, 0);
+            setEditTextMargins(GetDlgItem(form, ID_SHORTCUT), 0, 0);
         }
-        setEditTextMargins(GetDlgItem(s->scriptForm, ID_SCRIPT));
-        setEditTextMargins(GetDlgItem(s->actionForm, ID_ACTION_TARGET));
+        setEditTextMargins(GetDlgItem(s->scriptForm, ID_SCRIPT), 0, 0);
+        setEditTextMargins(GetDlgItem(s->actionForm, ID_ACTION_TARGET), 0, 0);
         for (int id : {ID_WORKSPACE_PATH, ID_MENU_JSON_PATH, ID_SCRIPT_FOLDER_PATH, ID_ICON_FOLDER_PATH})
-            setEditTextMargins(GetDlgItem(s->settingsForm, id));
+            setEditTextMargins(GetDlgItem(s->settingsForm, id), 0, 0);
         COMBOBOXINFO codePageCombo{sizeof(codePageCombo)};
-        if (GetComboBoxInfo(GetDlgItem(s->executeForm, ID_CODE_PAGE), &codePageCombo) && codePageCombo.hwndItem)
-            setEditTextMargins(codePageCombo.hwndItem);
+        if (GetComboBoxInfo(GetDlgItem(s->executeForm, ID_CODE_PAGE), &codePageCombo) && codePageCombo.hwndItem) {
+            const LONG_PTR editStyle = GetWindowLongPtrW(codePageCombo.hwndItem, GWL_STYLE);
+            SetWindowLongPtrW(codePageCombo.hwndItem, GWL_STYLE, editStyle | ES_MULTILINE);
+            setEditTextMargins(codePageCombo.hwndItem, 0, 0);
+            setMultilineTextOrigin(codePageCombo.hwndItem, 2, 1);
+        }
+        for (HWND form : {s->scriptForm, s->submenuForm, s->actionForm, s->executeForm}) {
+            setMultilineTextOrigin(GetDlgItem(form, ID_TITLE), 2, 1);
+            setMultilineTextOrigin(GetDlgItem(form, ID_SHORTCUT), 2, 1);
+        }
+        setMultilineTextOrigin(GetDlgItem(s->scriptForm, ID_SCRIPT), 2, 1);
+        setMultilineTextOrigin(GetDlgItem(s->actionForm, ID_ACTION_TARGET), 2, 1);
+        for (int id : {ID_WORKSPACE_PATH, ID_MENU_JSON_PATH, ID_SCRIPT_FOLDER_PATH, ID_ICON_FOLDER_PATH})
+            setMultilineTextOrigin(GetDlgItem(s->settingsForm, id), 2, 1);
         setMultilineTextOrigin(GetDlgItem(s->executeForm, ID_COMMAND), 2, 1);
         setMultilineTextOrigin(GetDlgItem(s->executeForm, ID_ENV_LIST), 2, 1);
 
@@ -2494,12 +2504,10 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         s->runIn = GetDlgItem(s->executeForm, ID_RUN_IN);
         fillRunIn(*s, L"output_pane");
         s->controlParent = hwnd;
-        resizeControlBy(hwnd, 93, 0);
-        resizeControlBy(s->tab, 93, 0);
-        resizeControlBy(s->tree, 93, -1);
-        offsetControlX(GetDlgItem(hwnd, ID_HEADER), 93);
-        centerChildHorizontally(hwnd, s->saveButton);
         layoutPageForms(*s);
+        positionHelpLink(*s, GetDlgItem(s->actionForm, ID_ACTION_TARGET_LABEL),
+                         GetDlgItem(s->actionForm, ID_ACTION_TARGET),
+                         GetDlgItem(s->actionForm, ID_ACTION_HELP));
         layoutPathsInfo(*s);
         bindItemForm(*s, nullptr);
         s->workspaceFolder = s->context.workspaceFolder;
@@ -2508,10 +2516,14 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         s->commandLabel = GetDlgItem(s->executeForm, ID_COMMAND_LABEL);
         s->command = GetDlgItem(s->executeForm, ID_COMMAND);
         s->commandHelp = GetDlgItem(s->executeForm, ID_COMMAND_HELP);
+        s->codePageLabel = GetDlgItem(s->executeForm, ID_CODE_PAGE_LABEL);
+        s->codePage = GetDlgItem(s->executeForm, ID_CODE_PAGE);
+        s->codePageHelp = GetDlgItem(s->executeForm, ID_CODE_PAGE_HELP);
         s->envLabel = GetDlgItem(s->executeForm, ID_ENV_LABEL);
         s->envList = GetDlgItem(s->executeForm, ID_ENV_LIST);
         s->envHelp = GetDlgItem(s->executeForm, ID_ENV_HELP);
         positionHelpLink(*s, s->commandLabel, s->command, s->commandHelp);
+        positionHelpLink(*s, s->codePageLabel, s->codePage, s->codePageHelp);
         positionHelpLink(*s, s->envLabel, s->envList, s->envHelp);
         s->controlParent = hwnd;
         showEditorPage(*s, 0);
@@ -2538,7 +2550,8 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         return TRUE;
     }
     if (message == WM_DRAWITEM &&
-        drawShortcutClear(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam), s->shortcutClearFont)) return TRUE;
+        drawShortcutClear(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam), s->shortcutClearFont,
+                          s->shortcutClearHovered)) return TRUE;
     if (message == WM_DRAWITEM &&
         drawHelpLink(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) return TRUE;
     if (message == WM_DRAWITEM &&
@@ -2633,12 +2646,19 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
     if (message == WM_COMMAND) {
         const int id = LOWORD(wParam), notification = HIWORD(wParam);
         if (id == ID_ACTION_HELP && notification == BN_CLICKED) {
-            ShellExecuteW(hwnd, L"open", L"https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/english.xml", nullptr, nullptr, SW_SHOWNORMAL);
+            const std::wstring url = nativeLanguageXmlUrl(s->context.owner);
+            ShellExecuteW(hwnd, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             return TRUE;
         }
         if ((id == ID_COMMAND_HELP || id == ID_ENV_HELP) && notification == BN_CLICKED) {
             if (!s->context.placeholdersUrl.empty())
                 ShellExecuteW(hwnd, L"open", s->context.placeholdersUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return TRUE;
+        }
+        if (id == ID_CODE_PAGE_HELP && notification == BN_CLICKED) {
+            ShellExecuteW(hwnd, L"open",
+                          L"https://learn.microsoft.com/windows/win32/intl/code-page-identifiers",
+                          nullptr, nullptr, SW_SHOWNORMAL);
             return TRUE;
         }
         if (id == ID_ACTION && notification == CBN_SELCHANGE) {
@@ -2650,6 +2670,7 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
     }
     if (message == WM_CLOSE) { onCommand(*s, ID_CANCEL, BN_CLICKED); return TRUE; }
     if (message == WM_DESTROY) {
+        if (s->shortcutTooltip) { DestroyWindow(s->shortcutTooltip); s->shortcutTooltip = nullptr; }
         if (s->shortcutClearFont) { DeleteObject(s->shortcutClearFont); s->shortcutClearFont = nullptr; }
         if (s->customIcon) { DestroyIcon(s->customIcon); s->customIcon = nullptr; }
         if (s->treeImages) {
