@@ -66,9 +66,25 @@ Notepad++\
 ```
 
 
-## 設定「選單」與「工具列」
+## 設定
 
-透過 [`menu.json`](./workspace-template/menu.json) 來設定「標題文字」並指定其「執行動作」。它長得像這樣：
+### 使用圖形介面
+
+從「外掛」>「NppMenuScripts」>「設定選單...」開啟設定視窗。
+
+- 在「選單／工具列」頁籤選取項目後，可編輯其標題、快捷鍵及執行設定。使用「新增」可加入腳本、動作、命令、子選單或分隔線。  
+  
+![選單設定畫面](screenshot/menu-setting.png)  
+
+- 在「設定」頁籤可調整工作區、選單設定檔、腳本及圖示資料夾，也可設定啟動時要隱藏的 Notepad++ 主選單。  
+  
+![路徑設定畫面](screenshot/path-setting.png)  
+
+- 按「儲存並重建」會將設定寫入 `menu.json` 並更新選單與工具列。隱藏 Notepad++ 主選單的設定需重新啟動 Notepad++ 才會生效。
+
+### `menu.json` 檔（進階使用者）
+
+所有設定會儲存到 [`menu.json`](./workspace-template/menu.json) 檔，你也可以透過編輯它來完成設定。它長得像這樣：
 
 ```json
 {
@@ -96,7 +112,7 @@ Notepad++\
 }
 ```
 
-- `menu.json` 必須位於「工作區資料夾」內。檔案為 UTF-8 編碼格式。可從「外掛選單」`開啟 menu.json` 進行編輯、或改變「工作區資料夾」位置。你可自由命名該資料夾名稱，不一定要叫 `workspace`。
+- `menu.json` 必須位於「工作區資料夾」內。檔案為 UTF-8 編碼格式。可在設定視窗的「設定」頁籤開啟檔案，或變更「工作區資料夾」位置。你可自由命名該資料夾名稱，不一定要叫 `workspace`。
 - `script_folder`：腳本資料夾。可使用絕對路徑，或以 `menu.json` 所在資料夾為基準的相對路徑，例如 `./script`、`../scripts`。  
 若更動了 `script_folder`，請將 `menu-helper.js` 和 `package.json` 拷到該資料夾的上一層，讓 Node.js 能找到 Package Import Alias。
 - `icon_folder`：工具列圖示資料夾；相對路徑以 `menu.json` 所在資料夾為基準。
@@ -133,14 +149,14 @@ Notepad++\
   - `sub`：子選單項目陣列，可包含子選單或腳本項目。僅在 `menu` 內有作用。
 
 
-### 小訣竅
+#### 小訣竅
 - 修改並儲存 menu.json 後可選擇「外掛選單」重建選單與工具列，不需重啟 Notepad++ 即可審視設定結果。
 - 按住 Ctrl 並點擊自訂的「選單項目」或「工具列按鈕」，可直接開啟對應腳本進行編輯；檔案不存在時可選擇建立範本。
 - 可從「外掛選單」選擇「停止腳本」，強制終止正在執行的腳本及由它啟動、受管理的子程序。
 - NppMenuScript 功能強大，如果你在 Notepad++ 啟動時不想看到主選單的「工具」、「巨集」及「執行」，你可以在 `menu.json` 加入欲隱藏的 [menuId](https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/taiwaneseMandarin.xml)，像這樣 `"hide_main_menus": ["tools", "macro", "run"]`。你完全可以透過 NppMenuScript 自行撰寫出自己想要的功能。
 
 
-### 鍵盤快捷鍵
+#### 鍵盤快捷鍵
 
 每個「選單項目名稱」後面，可以使用 **Tab 字元 `\t`** 加上快捷按鍵：
 

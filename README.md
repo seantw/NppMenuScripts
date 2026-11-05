@@ -63,9 +63,25 @@ Notepad++\
 │           └─ test.js
 ```
 
-## Configure menus and toolbars
+## Settings
 
-Use [`menu.json`](./workspace-template/menu.json) to configure item titles and actions. For example:
+### Using the GUI
+
+Open the configuration window from **Plugins > NppMenuScripts > Configure Menu...**.
+
+- Select an item on the **Menus / Toolbar** tab to edit its title, shortcut, and execution settings. Select **New** to add a script, action, command, submenu, or separator.  
+  
+![Menu settings](screenshot/menu-setting.png)  
+
+- On the **Settings** tab, configure the workspace, menu configuration file, script folder, and icon folder. You can also choose which Notepad++ main menus to hide at startup.  
+  
+![Path settings](screenshot/path-setting.png)  
+
+- Select **Save & Rebuild** to write the settings to `menu.json` and update the menus and toolbar. Changes to hidden Notepad++ main menus take effect after restarting Notepad++.
+
+### The `menu.json` file (Advanced users)
+
+All settings are saved to [`menu.json`](./workspace-template/menu.json). You can also configure them by editing this file. It looks like this:
 
 ```json
 {
@@ -93,7 +109,7 @@ Use [`menu.json`](./workspace-template/menu.json) to configure item titles and a
 }
 ```
 
-- `menu.json` must be in the workspace folder and use UTF-8 encoding. Choose **Open menu.json** from the plugin menu to edit it or change the workspace folder. You can name the workspace folder anything you like; it does not have to be named `workspace`.
+- `menu.json` must be in the workspace folder and use UTF-8 encoding. You can open the file or change the workspace folder from the **Settings** tab of the configuration window. You can name the workspace folder anything you like; it does not have to be named `workspace`.
 - `script_folder`: The script folder. Use an absolute path or a relative path based on the folder containing `menu.json`, such as `./script` or `../scripts`.  
 If you change `script_folder`, copy `menu-helper.js` and `package.json` to its parent folder so Node.js can resolve the package import alias.
 - `icon_folder`: The toolbar icon folder. Relative paths are based on the folder containing `menu.json`.
@@ -129,14 +145,14 @@ If you change `script_folder`, copy `menu-helper.js` and `package.json` to its p
   - `icon`: A toolbar button icon file in `.ico` format, 32×32 pixels with 32-bit color depth (full color and transparency). This property only applies to `toolbar` items.
   - `sub`: An array of submenu items, which can contain nested submenus or script items. This property only applies to `menu` items.
 
-### Tips
+#### Tips
 
 - After editing and saving `menu.json`, choose **Rebuild Menu & Toolbar** from the plugin menu to apply the changes. Notepad++ does not need to be restarted.
 - Hold Ctrl and click a custom menu item or toolbar button to open its script for editing. If the file does not exist, you can choose to create a template.
 - Choose **Stop Script** from the plugin menu to forcefully terminate a running script and its managed child processes.
 - NppMenuScripts is flexible. If you prefer not to see the **Tools**, **Macro**, and **Run** main menus when Notepad++ starts, add their [`menuId`](https://github.com/notepad-plus-plus/notepad-plus-plus/blob/master/PowerEditor/installer/nativeLang/english.xml) to `hide_main_menus` in `menu.json`, for example: `"hide_main_menus": ["tools", "macro", "run"]`. You can also use NppMenuScripts to create your own features.
 
-### Keyboard shortcuts
+#### Keyboard shortcuts
 
 Append a shortcut to a menu item title using a **tab character `\t`**:
 

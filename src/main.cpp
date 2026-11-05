@@ -51,10 +51,11 @@ static void runCurrentFile();
 static void openMenuJson();
 static void configureMenu();
 static void rebuildMenu();
-static bool chooseWorkspaceFolder(HWND owner);
+static bool chooseWorkspaceFolder(HWND owner, std::wstring& statusText);
 static bool openOrCreateScript(const std::wstring& scriptPath, HWND promptOwner = nullptr);
 static void stopScript();
 static bool installMenus(const std::wstring& jsonPath, bool forceRebuild = false);
+static std::wstring menuRebuildStatusText();
 static void removeMenus();
 static void runToolbarScript(size_t index);
 static bool setNppStatusText(const std::wstring& text);
@@ -104,6 +105,7 @@ static std::vector<std::wstring> g_toolbarTitles;
 static std::vector<toolbarIconsWithDarkMode> g_toolbarIcons;
 static bool g_toolbarIconsRegistered = false;
 static bool g_toolbarRestartRequired = false;
+static bool g_hiddenMenusRestartRequired = false;
 static int g_menuScriptCount = 0;
 
 static HMENU g_mainMenu = nullptr;
@@ -416,8 +418,8 @@ static const std::wstring& tr(const char* key)
         {"ExternalCommandStarted", L"External command started"},
         {"ExternalCommandFailed", L"External command failed"},
         {"ExternalCommandStopped", L"External command stopped"},
-        {"MenuRebuilt", L"Rebuilt: {path}"},
-        {"ToolbarRestartRequired", L"Restart Notepad++ for toolbar changes to take effect."},
+        {"MenuUpdated", L"Menu updated."},
+        {"PartialSettingsRestartRequired", L"Some settings require restarting Notepad++ to take effect."},
         {"PleaseWaitSetWorkspacePath", L"Please wait until the current script has finished before changing the workspace folder."},
         {"PleaseWait", L"Please wait until the current script has finished."},
         {"PleaseWaitRebuild", L"Please wait until the current script has finished before rebuilding the menu."},
@@ -429,7 +431,6 @@ static const std::wstring& tr(const char* key)
         {"WorkspacePathSaveFailed", L"Unable to save the workspace path."},
         {"WorkspaceInsidePluginFolder", L"Choose a workspace outside the NppMenuScripts plugin folder so Plugin Admin updates cannot replace your files."},
         {"SelectWorkspaceFolder", L"Select NppMenuScripts workspace folder"},
-        {"WorkspacePathSet", L"Workspace: {path}"},
         {"OpenGithubFailed", L"Unable to open the NppMenuScripts GitHub page."},
         {"ScriptAlreadyRunning", L"A script is already running."},
         {"HelperIncompatible", L"The NppMenuScripts helper module is incompatible with the loaded NppMenuScripts.dll.\r\n\r\nCopy the matching helper module next to NppMenuScripts.dll or into the parent directory of script_folder, then run the script again."},
@@ -1140,7 +1141,7 @@ static int CALLBACK workspaceFolderBrowseCallback(HWND hwnd, UINT message, LPARA
     return 0;
 }
 
-static bool chooseWorkspaceFolder(HWND owner)
+static bool chooseWorkspaceFolder(HWND owner, std::wstring& statusText)
 {
     if (g_processRunning.load()) {
         MessageBoxW(owner, tr("PleaseWaitSetWorkspacePath").c_str(),
@@ -1192,8 +1193,15 @@ static bool chooseWorkspaceFolder(HWND owner)
         installMenus(joinPath(oldWorkspace, L"menu.json"));
         return false;
     }
-    setNppStatusText(trFormat("WorkspacePathSet", {{L"{path}", g_workspaceFolder}}));
+    statusText = menuRebuildStatusText();
     return true;
+}
+
+static std::wstring menuRebuildStatusText()
+{
+    if (g_toolbarRestartRequired || g_hiddenMenusRestartRequired)
+        return tr("PartialSettingsRestartRequired");
+    return tr("MenuUpdated");
 }
 
 static void rebuildMenu()
@@ -1212,14 +1220,11 @@ static void rebuildMenu()
     if (!installMenus(path, true)) {
         installMenus(path, false);
     } else {
-        if (g_toolbarRestartRequired)
-            setNppStatusText(tr("ToolbarRestartRequired"));
-        else
-            setNppStatusText(trFormat("MenuRebuilt", {{L"{path}", g_menuJsonPath}}));
+        setNppStatusText(menuRebuildStatusText());
     }
 }
 
-static bool saveAndRebuildFromEditor(std::wstring& error)
+static bool saveAndRebuildFromEditor(std::wstring& error, std::wstring& statusText)
 {
     const std::wstring path = workspaceMenuPath();
     if (path.empty()) {
@@ -1228,8 +1233,7 @@ static bool saveAndRebuildFromEditor(std::wstring& error)
     }
     // installMenus() displays its own detailed error when it fails.
     if (!installMenus(path, true)) return false;
-    if (g_toolbarRestartRequired) setNppStatusText(tr("ToolbarRestartRequired"));
-    else setNppStatusText(trFormat("MenuRebuilt", {{L"{path}", g_menuJsonPath}}));
+    statusText = menuRebuildStatusText();
     return true;
 }
 
@@ -1248,6 +1252,13 @@ static void configureMenu()
     context.placeholdersUrl = (locale == L"zh-TW" || locale == L"zh-CN")
         ? L"https://github.com/seantw/NppMenuScripts/blob/main/README.zh-TW.md#command-env-placeholders"
         : L"https://github.com/seantw/NppMenuScripts/blob/main/README.md#command-env-placeholders";
+    const bool chineseReadme = locale == L"zh-TW" || locale == L"zh-CN";
+    const std::wstring readme = chineseReadme
+        ? L"https://github.com/seantw/NppMenuScripts/blob/main/README.zh-TW.md"
+        : L"https://github.com/seantw/NppMenuScripts/blob/main/README.md";
+    context.scriptRequirementsUrl = readme + (chineseReadme ? L"#系統需求" : L"#requirements");
+    context.scriptTemplateUrl = readme + (chineseReadme ? L"#api-參考" : L"#api-reference");
+    context.scriptApiUrl = readme + (chineseReadme ? L"#腳本語言" : L"#script-languages");
     context.chooseWorkspaceFolder = chooseWorkspaceFolder;
     context.openOrCreateScript = [](HWND owner, const std::wstring& path) { return openOrCreateScript(path, owner); };
     context.validate = [](cJSON* root, std::wstring& error) {
@@ -1311,7 +1322,17 @@ static void configureMenu()
         return true;
     };
     context.saveAndRebuild = saveAndRebuildFromEditor;
+    const std::wstring pluginVersion =
+        std::to_wstring(NPP_MENUSCRIPTS_VERSION_MAJOR) + L"." +
+        std::to_wstring(NPP_MENUSCRIPTS_VERSION_MINOR) + L"." +
+        std::to_wstring(NPP_MENUSCRIPTS_VERSION_PATCH) + L"." +
+        std::to_wstring(NPP_MENUSCRIPTS_VERSION_BUILD);
+    const std::wstring defaultEditorStatus = L"NppMenuScripts v" + pluginVersion;
+    std::wstring statusAfterWorkspaceChange;
     for (;;) {
+        context.initialStatus = statusAfterWorkspaceChange.empty()
+            ? defaultEditorStatus : statusAfterWorkspaceChange;
+        statusAfterWorkspaceChange.clear();
         context.menuPath = workspaceMenuPath();
         context.workspaceFolder = g_workspaceFolder;
         context.scriptFolder = g_scriptFolder;
@@ -1321,7 +1342,7 @@ static void configureMenu()
                         tr("ConfigTitle").c_str(), MB_OK | MB_ICONERROR);
             return;
         }
-        const MenuConfigEditorResult result = showMenuConfigEditor(context);
+        const MenuConfigEditorResult result = showMenuConfigEditor(context, &statusAfterWorkspaceChange);
         if (result == MenuConfigEditorResult::WorkspaceChanged) continue;
         return;
     }
@@ -5213,7 +5234,6 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
             configuredHiddenMainMenuIds.push_back(utf8ToWide(item->valuestring));
         }
     }
-    g_hiddenMainMenuIds = std::move(configuredHiddenMainMenuIds);
     // Validate the new configuration completely before removing the current menu.
     // This keeps the existing menu available when Rebuild Menu & Toolbar encounters invalid JSON.
     int itemCount = 0;
@@ -5315,17 +5335,21 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
         MessageBoxW(g_nppData._nppHandle, tr("ToolbarLimit").c_str(), L"NppMenuScripts", MB_OK | MB_ICONERROR);
         return false;
     }
-    if (g_toolbarIconsRegistered) {
-        g_toolbarRestartRequired = configuredToolbarScripts != g_toolbarScriptFiles ||
-            configuredToolbarActions != g_toolbarActions ||
-            configuredToolbarActionTargets != g_toolbarActionTargets ||
-            configuredToolbarExecuteOptions != g_toolbarExecuteOptions ||
-            configuredToolbarIcons != g_toolbarIconFiles ||
-            configuredToolbarTitles != g_toolbarTitles;
-        if (g_toolbarRestartRequired)
-            debugLog(L"Toolbar configuration changed; restart Notepad++ for toolbar changes to take effect");
-    } else {
-        g_toolbarRestartRequired = false;
+    // Compare against the toolbar configuration registered with Notepad++.
+    // Keep this baseline unchanged during rebuilds so the restart notice stays
+    // visible until the config matches the toolbar loaded at startup again.
+    const bool toolbarConfigChanged = g_toolbarIconsRegistered &&
+        (configuredToolbarScripts != g_toolbarScriptFiles ||
+         configuredToolbarActions != g_toolbarActions ||
+         configuredToolbarActionTargets != g_toolbarActionTargets ||
+         configuredToolbarExecuteOptions != g_toolbarExecuteOptions ||
+         configuredToolbarIcons != g_toolbarIconFiles ||
+         configuredToolbarTitles != g_toolbarTitles);
+    // g_hiddenMainMenuIds records the list applied at startup. Since hiding is
+    // startup-only, do not replace that baseline on a successful menu rebuild.
+    const bool hiddenMenusConfigChanged = g_hiddenMainMenusApplied &&
+        configuredHiddenMainMenuIds != g_hiddenMainMenuIds;
+    if (!g_toolbarIconsRegistered) {
         g_toolbarScriptFiles = configuredToolbarScripts;
         g_toolbarActions = configuredToolbarActions;
         g_toolbarActionTargets = configuredToolbarActionTargets;
@@ -5363,6 +5387,11 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
     debugLog(L"menu.json=" + jsonPath);
     debugLog(L"script_folder=" + g_scriptFolder);
     debugLog(L"output_pane_title=" + g_outputTitle);
+    // hideConfiguredMainMenus() applies this only once per Notepad++ process.
+    // On later rebuilds, keep the old applied list until the install succeeds
+    // so a failed configuration does not become the comparison baseline.
+    if (!g_hiddenMainMenusApplied)
+        g_hiddenMainMenuIds = configuredHiddenMainMenuIds;
     hideConfiguredMainMenus();
     int helpMenuPosition = findHelpMenuPosition(g_mainMenu);
     for (cJSON* top = menuItem->child; top; top = top->next) {
@@ -5404,6 +5433,12 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
         registerHotkeyForItem(g_toolbarTitles[i], commandId);
     }
     DrawMenuBar(g_nppData._nppHandle);
+    g_toolbarRestartRequired = g_toolbarIconsRegistered && toolbarConfigChanged;
+    g_hiddenMenusRestartRequired = g_hiddenMainMenusApplied && hiddenMenusConfigChanged;
+    if (g_toolbarRestartRequired)
+        debugLog(L"Toolbar configuration changed in this rebuild; restart Notepad++ for toolbar changes to take effect");
+    if (g_hiddenMenusRestartRequired)
+        debugLog(L"hide_main_menus changed in this rebuild; restart Notepad++ for hidden menu changes to take effect");
     g_installed = true;
     debugLog(L"installMenus complete scriptCount=" + std::to_wstring(g_scriptPaths.size()));
     cJSON_Delete(root);

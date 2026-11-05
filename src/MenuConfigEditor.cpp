@@ -4,6 +4,7 @@
 #include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <richedit.h>
 #include <shlobj.h>
 #include <shellapi.h>
 #include <uxtheme.h>
@@ -44,6 +45,13 @@ struct EditorNode {
     unsigned int depth = 0;
     std::wstring environmentText;
     bool environmentTextLoaded = false;
+};
+
+struct RichHelpLink {
+    HWND control = nullptr;
+    LONG start = 0;
+    LONG end = 0;
+    std::wstring url;
 };
 
 struct EditorState {
@@ -95,6 +103,9 @@ struct EditorState {
     HWND envAdd = nullptr;
     HWND envRemove = nullptr;
     HWND info = nullptr;
+    HWND scriptHelpText = nullptr;
+    HWND actionHelpText = nullptr;
+    HWND submenuHelpText = nullptr;
     HWND newButton = nullptr;
     HWND deleteButton = nullptr;
     HWND upButton = nullptr;
@@ -108,15 +119,22 @@ struct EditorState {
     HWND menuJsonBrowse = nullptr;
     HWND menuJsonOpen = nullptr;
     HWND pathsInfoGroup = nullptr;
-    HWND pathsInfoText = nullptr;
-    HWND pathsInfoBullet1 = nullptr;
-    HWND pathsInfoText2 = nullptr;
-    HWND pathsInfoBullet2 = nullptr;
+    HWND pathsInfoRichEdit = nullptr;
+    HWND hideMenuGroup = nullptr;
+    HWND hideEncoding = nullptr;
+    HWND hideLanguage = nullptr;
+    HWND hideTools = nullptr;
+    HWND hideMacro = nullptr;
+    HWND hideRun = nullptr;
+    HWND hideMenuRestart = nullptr;
     HWND scriptFolderSet = nullptr;
     HWND scriptFolderOpen = nullptr;
     HWND iconFolderSet = nullptr;
     HWND iconFolderOpen = nullptr;
     HWND saveButton = nullptr;
+    HWND statusBar = nullptr;
+    std::wstring statusText;
+    std::wstring pendingStatus;
     HWND shortcutTooltip = nullptr;
     HFONT font = nullptr;
     HFONT shortcutClearFont = nullptr;
@@ -128,6 +146,7 @@ struct EditorState {
     EditorNode* selected = nullptr;
     std::vector<std::unique_ptr<EditorNode>> nodes;
     std::map<std::wstring, std::wstring> environment;
+    std::vector<RichHelpLink> richHelpLinks;
     std::wstring currentIconPath;
     std::wstring shortcutHintText;
     std::wstring workspaceFolder;
@@ -143,6 +162,20 @@ struct EditorState {
     HTREEITEM dragTarget = nullptr;
     HTREEITEM pendingExpand = nullptr;
     DropPosition dropPosition = DropPosition::None;
+};
+
+struct HideMenuOption {
+    int controlId;
+    const char* menuId;
+    HWND EditorState::* checkbox;
+};
+
+static constexpr HideMenuOption HIDE_MENU_OPTIONS[] = {
+    {ID_HIDE_ENCODING, "encoding", &EditorState::hideEncoding},
+    {ID_HIDE_LANGUAGE, "language", &EditorState::hideLanguage},
+    {ID_HIDE_TOOLS, "tools", &EditorState::hideTools},
+    {ID_HIDE_MACRO, "macro", &EditorState::hideMacro},
+    {ID_HIDE_RUN, "run", &EditorState::hideRun},
 };
 
 static std::wstring tr(EditorState& s, const char* key)
@@ -371,6 +404,82 @@ static bool setBool(cJSON* object, const char* key, bool value)
     return cJSON_AddItemToObject(object, key, replacement) != 0;
 }
 
+static bool isHideMenuOptionControl(int controlId)
+{
+    for (const HideMenuOption& option : HIDE_MENU_OPTIONS)
+        if (option.controlId == controlId) return true;
+    return false;
+}
+
+static void loadHideMenuOptions(EditorState& s)
+{
+    cJSON* configured = member(s.root, "hide_main_menus");
+    for (const HideMenuOption& option : HIDE_MENU_OPTIONS) {
+        bool checked = false;
+        if (cJSON_IsArray(configured)) {
+            for (cJSON* item = configured->child; item; item = item->next) {
+                if (cJSON_IsString(item) && item->valuestring &&
+                    std::strcmp(item->valuestring, option.menuId) == 0) {
+                    checked = true;
+                    break;
+                }
+            }
+        }
+        HWND checkbox = s.*(option.checkbox);
+        if (checkbox) SendMessageW(checkbox, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+}
+
+static bool commitHideMenuOptions(EditorState& s)
+{
+    cJSON* array = cJSON_CreateArray();
+    if (!array) return false;
+
+    bool written[sizeof(HIDE_MENU_OPTIONS) / sizeof(HIDE_MENU_OPTIONS[0])]{};
+    cJSON* existing = member(s.root, "hide_main_menus");
+    if (cJSON_IsArray(existing)) {
+        for (cJSON* item = existing->child; item; item = item->next) {
+            if (!cJSON_IsString(item) || !item->valuestring) continue;
+            size_t optionIndex = 0;
+            for (; optionIndex < sizeof(HIDE_MENU_OPTIONS) / sizeof(HIDE_MENU_OPTIONS[0]); ++optionIndex)
+                if (std::strcmp(item->valuestring, HIDE_MENU_OPTIONS[optionIndex].menuId) == 0) break;
+
+            if (optionIndex < sizeof(HIDE_MENU_OPTIONS) / sizeof(HIDE_MENU_OPTIONS[0])) {
+                const HideMenuOption& option = HIDE_MENU_OPTIONS[optionIndex];
+                HWND checkbox = s.*(option.checkbox);
+                const bool checked = checkbox && SendMessageW(checkbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                if (checked && !written[optionIndex]) {
+                    if (!cJSON_AddItemToArray(array, cJSON_CreateString(option.menuId))) {
+                        cJSON_Delete(array);
+                        return false;
+                    }
+                    written[optionIndex] = true;
+                }
+            } else if (!cJSON_AddItemToArray(array, cJSON_CreateString(item->valuestring))) {
+                cJSON_Delete(array);
+                return false;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < sizeof(HIDE_MENU_OPTIONS) / sizeof(HIDE_MENU_OPTIONS[0]); ++i) {
+        const HideMenuOption& option = HIDE_MENU_OPTIONS[i];
+        HWND checkbox = s.*(option.checkbox);
+        const bool checked = checkbox && SendMessageW(checkbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        if (checked && !written[i] && !cJSON_AddItemToArray(array, cJSON_CreateString(option.menuId))) {
+            cJSON_Delete(array);
+            return false;
+        }
+    }
+
+    cJSON* previous = member(s.root, "hide_main_menus");
+    const bool ok = previous
+        ? cJSON_ReplaceItemInObjectCaseSensitive(s.root, "hide_main_menus", array) != 0
+        : cJSON_AddItemToObject(s.root, "hide_main_menus", array) != 0;
+    if (!ok) cJSON_Delete(array);
+    return ok;
+}
+
 static void setPropertyName(cJSON* item, const std::wstring& name)
 {
     const std::string utf8 = toUtf8(name);
@@ -391,87 +500,140 @@ static HWND control(EditorState& s, const wchar_t* type, const std::wstring& lab
     return hwnd;
 }
 
-static std::vector<std::wstring> splitPathInfoParagraphs(const std::wstring& text)
+static COLORREF richHelpBackgroundColor(const EditorState& s, HWND control)
 {
-    std::vector<std::wstring> paragraphs;
-    std::wstring paragraph;
-    for (size_t i = 0; i < text.size(); ++i) {
-        if (text[i] == L'\r' || text[i] == L'\n') {
-            if (!paragraph.empty()) {
-                paragraphs.push_back(std::move(paragraph));
-                paragraph.clear();
+    // Rich Edit needs a solid background color. Ask the themed page parent to
+    // paint the area behind this child into a temporary bitmap, then sample an
+    // interior pixel. This matches the actual ETDT_ENABLETAB page rendering,
+    // unlike COLOR_WINDOW or the theme's approximate fill-color hint.
+    RECT client{};
+    if (control && GetClientRect(control, &client)) {
+        const int width = client.right - client.left;
+        const int height = client.bottom - client.top;
+        HDC referenceDc = GetDC(control);
+        if (referenceDc && width > 0 && height > 0) {
+            HDC memoryDc = CreateCompatibleDC(referenceDc);
+            HBITMAP bitmap = memoryDc ? CreateCompatibleBitmap(referenceDc, width, height) : nullptr;
+            if (memoryDc && bitmap) {
+                HGDIOBJ previousBitmap = SelectObject(memoryDc, bitmap);
+                if (DrawThemeParentBackground(control, memoryDc, &client) == S_OK) {
+                    const COLORREF sampled = GetPixel(memoryDc, width / 2, height / 2);
+                    if (sampled != CLR_INVALID) {
+                        SelectObject(memoryDc, previousBitmap);
+                        DeleteObject(bitmap);
+                        DeleteDC(memoryDc);
+                        ReleaseDC(control, referenceDc);
+                        return sampled;
+                    }
+                }
+                SelectObject(memoryDc, previousBitmap);
             }
-            while (i + 1 < text.size() && (text[i + 1] == L'\r' || text[i + 1] == L'\n')) ++i;
-        } else {
-            paragraph.push_back(text[i]);
+            if (bitmap) DeleteObject(bitmap);
+            if (memoryDc) DeleteDC(memoryDc);
+            ReleaseDC(control, referenceDc);
+        } else if (referenceDc) {
+            ReleaseDC(control, referenceDc);
         }
     }
-    if (!paragraph.empty()) paragraphs.push_back(std::move(paragraph));
-    return paragraphs;
+
+    // Fallback for themes that do not support drawing the tab parent.
+    if (s.tab) {
+        HTHEME theme = OpenThemeData(s.tab, L"TAB");
+        if (theme) {
+            COLORREF color{};
+            // TABP_BODY=10, normal state=1, TMT_FILLCOLORHINT=3821.
+            const HRESULT result = GetThemeColor(theme, 10, 1, 3821, &color);
+            CloseThemeData(theme);
+            if (SUCCEEDED(result)) return color;
+        }
+    }
+    return GetSysColor(COLOR_BTNFACE);
 }
 
-static int measureWrappedStaticHeight(HWND hwnd, const std::wstring& text)
+static void setRichHelpContent(EditorState& s, HWND control,
+                               const std::vector<std::pair<std::wstring, std::wstring>>& paragraphs,
+                               int paragraphGapTwips, size_t firstBulletParagraph = 0)
 {
-    RECT client{};
-    if (!hwnd || !GetClientRect(hwnd, &client)) return 0;
-    RECT measure{0, 0, client.right, 0};
-    HDC dc = GetDC(hwnd);
-    if (!dc) return 0;
-    HFONT font = reinterpret_cast<HFONT>(SendMessageW(hwnd, WM_GETFONT, 0, 0));
-    HGDIOBJ previousFont = font ? SelectObject(dc, font) : nullptr;
-    DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &measure,
-              DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
-    if (previousFont) SelectObject(dc, previousFont);
-    ReleaseDC(hwnd, dc);
-    return std::max<LONG>(14, measure.bottom - measure.top + 1);
+    if (!control) return;
+    s.richHelpLinks.erase(std::remove_if(s.richHelpLinks.begin(), s.richHelpLinks.end(),
+        [control](const RichHelpLink& link) { return link.control == control; }), s.richHelpLinks.end());
+
+    std::wstring content;
+    std::vector<std::pair<LONG, LONG>> paragraphRanges;
+    for (size_t i = 0; i < paragraphs.size(); ++i) {
+        if (i) content.push_back(L'\r');
+        const LONG start = static_cast<LONG>(content.size());
+        content += paragraphs[i].first;
+        const LONG end = static_cast<LONG>(content.size());
+        paragraphRanges.emplace_back(start, end);
+        if (!paragraphs[i].second.empty()) {
+            content += L" (?)";
+            s.richHelpLinks.push_back({control, end + 1, end + 4, paragraphs[i].second});
+        }
+    }
+
+    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(s.font), TRUE);
+    SendMessageW(control, EM_SETBKGNDCOLOR, FALSE, richHelpBackgroundColor(s, control));
+    SetWindowTextW(control, content.c_str());
+    SendMessageW(control, EM_SETEVENTMASK, 0,
+                 SendMessageW(control, EM_GETEVENTMASK, 0, 0) | ENM_LINK);
+
+    CHARFORMAT2W characterFormat{};
+    characterFormat.cbSize = sizeof(characterFormat);
+    characterFormat.dwMask = CFM_FACE | CFM_SIZE | CFM_COLOR;
+    characterFormat.yHeight = 180;
+    characterFormat.crTextColor = GetSysColor(COLOR_WINDOWTEXT);
+    wcscpy_s(characterFormat.szFaceName, LF_FACESIZE, L"MS Shell Dlg");
+    SendMessageW(control, EM_SETSEL, 0, -1);
+    SendMessageW(control, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&characterFormat));
+
+    for (size_t paragraphIndex = 0; paragraphIndex < paragraphRanges.size(); ++paragraphIndex) {
+        const auto& range = paragraphRanges[paragraphIndex];
+        PARAFORMAT2 paragraphFormat{};
+        paragraphFormat.cbSize = sizeof(paragraphFormat);
+        paragraphFormat.dwMask = PFM_NUMBERING | PFM_STARTINDENT | PFM_OFFSET |
+                                 PFM_SPACEAFTER | PFM_TABSTOPS;
+        const bool isBullet = paragraphIndex >= firstBulletParagraph;
+        paragraphFormat.wNumbering = isBullet ? PFN_BULLET : 0;
+        // Keep bullets at the help block's left edge. The tab stop controls
+        // where each bullet paragraph begins; dxOffset aligns wrapped lines.
+        paragraphFormat.dxStartIndent = 0;
+        paragraphFormat.dxOffset = isBullet ? 240 : 0;
+        paragraphFormat.dySpaceAfter = paragraphGapTwips;
+        paragraphFormat.cTabCount = isBullet ? 1 : 0;
+        if (isBullet) paragraphFormat.rgxTabs[0] = 240;
+        SendMessageW(control, EM_SETSEL, range.first, range.second);
+        SendMessageW(control, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&paragraphFormat));
+    }
+
+    for (const RichHelpLink& link : s.richHelpLinks) {
+        if (link.control != control) continue;
+        CHARFORMAT2W linkFormat{};
+        linkFormat.cbSize = sizeof(linkFormat);
+        linkFormat.dwMask = CFM_LINK | CFM_UNDERLINE | CFM_COLOR;
+        linkFormat.dwEffects = CFE_LINK | CFE_UNDERLINE;
+        linkFormat.crTextColor = GetSysColor(COLOR_HOTLIGHT);
+        SendMessageW(control, EM_SETSEL, link.start, link.end);
+        SendMessageW(control, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&linkFormat));
+    }
+    SendMessageW(control, EM_SETSEL, 0, 0);
 }
 
-static bool getChildRectInParent(HWND parent, HWND child, RECT& rect)
+static void setRichPlainText(EditorState& s, HWND control, const std::wstring& text)
 {
-    if (!parent || !child || !GetWindowRect(child, &rect)) return false;
-    MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&rect), 2);
-    return true;
-}
-
-static void layoutPathsInfo(EditorState& s)
-{
-    if (!s.settingsForm || !s.pathsInfoText || !s.pathsInfoText2 ||
-        !s.pathsInfoBullet1 || !s.pathsInfoBullet2) return;
-
-    const std::vector<std::wstring> paragraphs = splitPathInfoParagraphs(tr(s, "ConfigPathsInfoText"));
-    const std::wstring bullet = L"•";
-    SetWindowTextW(s.pathsInfoBullet1, paragraphs.empty() ? L"" : bullet.c_str());
-    SetWindowTextW(s.pathsInfoText, paragraphs.empty() ? L"" : paragraphs[0].c_str());
-    SetWindowTextW(s.pathsInfoBullet2, paragraphs.size() < 2 ? L"" : bullet.c_str());
-    SetWindowTextW(s.pathsInfoText2, paragraphs.size() < 2 ? L"" : paragraphs[1].c_str());
-
-    RECT firstText{}, secondText{}, firstBullet{}, secondBullet{};
-    if (!getChildRectInParent(s.settingsForm, s.pathsInfoText, firstText) ||
-        !getChildRectInParent(s.settingsForm, s.pathsInfoText2, secondText) ||
-        !getChildRectInParent(s.settingsForm, s.pathsInfoBullet1, firstBullet) ||
-        !getChildRectInParent(s.settingsForm, s.pathsInfoBullet2, secondBullet)) return;
-
-    const int firstHeight = measureWrappedStaticHeight(s.pathsInfoText,
-        paragraphs.empty() ? std::wstring() : paragraphs[0]);
-    const int secondHeight = measureWrappedStaticHeight(s.pathsInfoText2,
-        paragraphs.size() < 2 ? std::wstring() : paragraphs[1]);
-    const int paragraphGap = 7;
-    const int secondY = firstText.top + firstHeight + paragraphGap;
-
-    SetWindowPos(s.pathsInfoText, nullptr, firstText.left, firstText.top,
-                 firstText.right - firstText.left, firstHeight,
-                 SWP_NOZORDER | SWP_NOACTIVATE);
-    SetWindowPos(s.pathsInfoBullet1, nullptr, firstBullet.left, firstText.top,
-                 firstBullet.right - firstBullet.left, firstHeight,
-                 SWP_NOZORDER | SWP_NOACTIVATE);
-    SetWindowPos(s.pathsInfoText2, nullptr, secondText.left, secondY,
-                 secondText.right - secondText.left, secondHeight,
-                 SWP_NOZORDER | SWP_NOACTIVATE);
-    SetWindowPos(s.pathsInfoBullet2, nullptr, secondBullet.left, secondY,
-                 secondBullet.right - secondBullet.left, secondHeight,
-                 SWP_NOZORDER | SWP_NOACTIVATE);
-    ShowWindow(s.pathsInfoBullet2, paragraphs.size() > 1 ? SW_SHOW : SW_HIDE);
-    ShowWindow(s.pathsInfoText2, paragraphs.size() > 1 ? SW_SHOW : SW_HIDE);
+    if (!control) return;
+    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(s.font), TRUE);
+    SendMessageW(control, EM_SETBKGNDCOLOR, FALSE, richHelpBackgroundColor(s, control));
+    SetWindowTextW(control, text.c_str());
+    CHARFORMAT2W characterFormat{};
+    characterFormat.cbSize = sizeof(characterFormat);
+    characterFormat.dwMask = CFM_FACE | CFM_SIZE | CFM_COLOR;
+    characterFormat.yHeight = 180;
+    characterFormat.crTextColor = GetSysColor(COLOR_WINDOWTEXT);
+    wcscpy_s(characterFormat.szFaceName, LF_FACESIZE, L"MS Shell Dlg");
+    SendMessageW(control, EM_SETSEL, 0, -1);
+    SendMessageW(control, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&characterFormat));
+    SendMessageW(control, EM_SETSEL, 0, 0);
 }
 
 static void show(HWND hwnd, bool visible)
@@ -1238,7 +1400,7 @@ static void showTypeControls(EditorState& s, NodeKind kind, bool hasItem)
 
 }
 
-static void showActionTargetControls(EditorState& s, bool visible)
+static void showActionTargetControls(EditorState& s, bool visible, bool repaintPage = true)
 {
     HWND form = s.actionTargetLabel ? GetParent(s.actionTargetLabel) : nullptr;
     if (!visible && s.actionTarget) SetWindowTextW(s.actionTarget, L"");
@@ -1247,7 +1409,7 @@ static void showActionTargetControls(EditorState& s, bool visible)
         ShowWindow(control, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
     }
     EnableWindow(s.actionTarget, visible);
-    if (form && s.activeItemForm == form) {
+    if (repaintPage && form && s.activeItemForm == form) {
         // Tab/item changes hide the child page before the host background is
         // repainted. Mirror that sequence here so transparent static labels
         // and edit borders cannot leave stale pixels when the menu-path row hides.
@@ -1285,7 +1447,9 @@ static void loadSelected(EditorState& s, EditorNode* node)
         const std::wstring token = cJSON_IsString(value) ? fromUtf8(value->valuestring) : L"RUN_CURRENT_FILE";
         fillActionCombo(s, token);
         SetWindowTextW(s.actionTarget, token.rfind(L"MENU:", 0) == 0 ? token.substr(5).c_str() : L"");
-        showActionTargetControls(s, token.rfind(L"MENU:", 0) == 0);
+        // loadSelected() repaints the active child page once after all fields
+        // are populated, so avoid repainting it again while binding the row.
+        showActionTargetControls(s, token.rfind(L"MENU:", 0) == 0, false);
     }
     if (node && node->kind == NodeKind::Execute) {
         cJSON* execute = member(node->value, "execute");
@@ -1306,9 +1470,7 @@ static void loadSelected(EditorState& s, EditorNode* node)
     } else {
         s.environment.clear();
     }
-    // Keep the last execute item's text while the shared control is hidden.
-    // Clearing it here makes the edit lose its visible contents on re-entry
-    // on some Windows repaint paths, even though the JSON still has the data.
+    // Reset the previous toolbar item's icon before loading this item's icon.
     s.currentIconPath.clear();
     if (s.toolbarItem) {
         cJSON* icon = member(node->value, "icon");
@@ -1326,8 +1488,8 @@ static void loadSelected(EditorState& s, EditorNode* node)
     }
     EnableWindow(s.upButton, hasPrevious);
     EnableWindow(s.downButton, hasNext);
-    if (!hasItem) SetWindowTextW(s.info, tr(s, node && node->kind == NodeKind::ToolbarRoot ? "ConfigSelectToolbar" : "ConfigSelectMenu").c_str());
-    else if (separator) SetWindowTextW(s.info, tr(s, "ConfigSeparatorInfo").c_str());
+    if (!hasItem) setRichPlainText(s, s.info, tr(s, node && node->kind == NodeKind::ToolbarRoot ? "ConfigSelectToolbar" : "ConfigSelectMenu"));
+    else if (separator) setRichPlainText(s, s.info, tr(s, "ConfigSeparatorInfo"));
     s.updating = false;
 
     if (s.activePage == 0 && s.activeItemForm)
@@ -1351,6 +1513,11 @@ static bool commitSelected(EditorState& s)
         return true;
     }
     std::wstring title = readText(s.title);
+    const std::wstring shortcut = readText(s.shortcut);
+    if (!shortcut.empty()) {
+        title.push_back(L'\t');
+        title += shortcut;
+    }
     if (!setObjectString(node->value, "title", title)) return false;
     if (node->kind == NodeKind::Script) {
         if (!setObjectString(node->value, "script", storedScriptPath(s.scriptFolder, readText(s.script)))) return false;
@@ -1523,6 +1690,7 @@ static bool validateAndCommit(EditorState& s, std::wstring& error)
             DestroyIcon(check);
         }
     }
+    if (!commitHideMenuOptions(s)) { error = tr(s, "ConfigSaveFailed"); return false; }
     if (s.context.validate && !s.context.validate(s.root, error)) return false;
     return true;
 }
@@ -1554,7 +1722,45 @@ static bool saveAndRebuild(EditorState& s, std::wstring& error)
         error = tr(s, "ConfigRebuildFailed");
         return false;
     }
-    return s.context.saveAndRebuild(error);
+    std::wstring status;
+    if (!s.context.saveAndRebuild(error, status)) return false;
+    if (s.statusBar) {
+        s.statusText = std::move(status);
+        SendMessageW(s.statusBar, SB_SETTEXTW, SBT_OWNERDRAW, 0);
+        UpdateWindow(s.statusBar);
+    }
+    return true;
+}
+
+static void clearEditorStatus(EditorState& s)
+{
+    if (!s.statusBar) return;
+    s.statusText.clear();
+    SendMessageW(s.statusBar, SB_SETTEXTW, SBT_OWNERDRAW, 0);
+    UpdateWindow(s.statusBar);
+}
+
+static int dialogUnitsToPixelsX(HWND dialog, int units)
+{
+    RECT rect{0, 0, units, 0};
+    if (!dialog || !MapDialogRect(dialog, &rect)) return units;
+    return rect.right;
+}
+
+static bool drawEditorStatus(EditorState& s, const DRAWITEMSTRUCT& draw)
+{
+    if (draw.CtlID != ID_EDITOR_STATUS || draw.hwndItem != s.statusBar) return false;
+    const int saved = SaveDC(draw.hDC);
+    SetBkMode(draw.hDC, TRANSPARENT);
+    SetTextColor(draw.hDC, GetSysColor(COLOR_WINDOWTEXT));
+    HGDIOBJ oldFont = s.font ? SelectObject(draw.hDC, s.font) : nullptr;
+    RECT textRect = draw.rcItem;
+    textRect.left += dialogUnitsToPixelsX(s.hwnd, 6);
+    DrawTextW(draw.hDC, s.statusText.c_str(), static_cast<int>(s.statusText.size()), &textRect,
+              DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+    if (oldFont) SelectObject(draw.hDC, oldFont);
+    if (saved) RestoreDC(draw.hDC, saved);
+    return true;
 }
 
 static void showSaveError(EditorState& s, const std::wstring& error)
@@ -1963,7 +2169,6 @@ static void showEditorPage(EditorState& s, int page)
         show(s.downButton, true);
         show(s.tree, true);
         loadSelected(s, s.selected);
-        UpdateWindow(s.hwnd);
         SetFocus(s.tree);
     } else {
         showChildDialogAndRepaint(s.hwnd, s.settingsForm);
@@ -2033,6 +2238,7 @@ static void onCommand(EditorState& s, int id, int notification)
     else if (id == ID_UP && notification == BN_CLICKED) moveSelected(s, true);
     else if (id == ID_DOWN && notification == BN_CLICKED) moveSelected(s, false);
     else if (id == ID_SAVE_REBUILD && notification == BN_CLICKED) {
+        clearEditorStatus(s);
         std::wstring error;
         if (!saveFile(s, error)) { MessageBoxW(s.hwnd, error.c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONERROR); return; }
         if (!saveAndRebuild(s, error)) { showSaveError(s, error); return; }
@@ -2050,12 +2256,13 @@ static void onCommand(EditorState& s, int id, int notification)
     } else if (!s.updating && id == ID_RUN_IN && notification == CBN_SELCHANGE) s.dirty = true;
     else if (!s.updating && id == ID_CODE_PAGE && (notification == CBN_SELCHANGE || notification == CBN_EDITCHANGE)) s.dirty = true;
     else if (!s.updating && id == ID_SAVE_BEFORE_RUN && notification == BN_CLICKED) s.dirty = true;
+    else if (!s.updating && notification == BN_CLICKED && isHideMenuOptionControl(id)) s.dirty = true;
     else if (id == ID_SCRIPT_BROWSE && notification == BN_CLICKED) chooseScriptFile(s);
     else if (id == ID_SCRIPT_EDIT && notification == BN_CLICKED) editScriptFile(s);
     else if (id == ID_ICON && notification == BN_CLICKED) chooseIcon(s);
     else if (id == ID_WORKSPACE_SET && notification == BN_CLICKED) {
         if (!confirmPendingChanges(s)) return;
-        if (s.context.chooseWorkspaceFolder && s.context.chooseWorkspaceFolder(s.hwnd))
+        if (s.context.chooseWorkspaceFolder && s.context.chooseWorkspaceFolder(s.hwnd, s.pendingStatus))
             EndDialog(s.hwnd, CONFIG_EDITOR_WORKSPACE_CHANGED_RESULT);
     } else if (id == ID_WORKSPACE_OPEN && notification == BN_CLICKED) openFolder(s, s.workspaceFolder);
     else if (id == ID_MENU_JSON_OPEN && notification == BN_CLICKED) {
@@ -2245,7 +2452,9 @@ static INT_PTR CALLBACK pageDialogProc(HWND hwnd, UINT message, WPARAM wParam, L
         // of painting the default gray button-face rectangle behind their text.
         SetBkMode(reinterpret_cast<HDC>(wParam), TRANSPARENT);
         return reinterpret_cast<INT_PTR>(GetStockObject(NULL_BRUSH));
-    case WM_COMMAND: case WM_NOTIFY: case WM_DRAWITEM: case WM_MEASUREITEM: case WM_HSCROLL:
+    case WM_DRAWITEM:
+        return SendMessageW(s->hwnd, message, wParam, lParam);
+    case WM_COMMAND: case WM_NOTIFY: case WM_MEASUREITEM: case WM_HSCROLL:
         return SendMessageW(s->hwnd, message, wParam, lParam);
     }
     return FALSE;
@@ -2395,12 +2604,14 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
                 registerItemForm(form, ID_SCRIPT);
                 registerItemForm(form, ID_SCRIPT_BROWSE, tr(*s, "ConfigBrowse"));
                 registerItemForm(form, ID_SCRIPT_EDIT, tr(*s, "ConfigEditScript"));
+                s->scriptHelpText = GetDlgItem(form, ID_SCRIPT_HELP_RICH_EDIT);
             } else if (form == s->actionForm) {
                 registerItemForm(form, ID_ACTION_LABEL, tr(*s, "ConfigAction"));
                 registerItemForm(form, ID_ACTION);
                 registerItemForm(form, ID_ACTION_TARGET_LABEL, tr(*s, "ConfigMenuPathOrId"));
                 registerItemForm(form, ID_ACTION_TARGET);
                 registerItemForm(form, ID_ACTION_HELP);
+                s->actionHelpText = GetDlgItem(form, ID_ACTION_HELP_RICH_EDIT);
             } else if (form == s->executeForm) {
                 registerItemForm(form, ID_COMMAND_LABEL, tr(*s, "ConfigCommand"));
                 registerItemForm(form, ID_COMMAND);
@@ -2414,6 +2625,8 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
                 registerItemForm(form, ID_ENV_LABEL, tr(*s, "ConfigEnvironment"));
                 registerItemForm(form, ID_ENV_LIST);
                 registerItemForm(form, ID_ENV_HELP);
+            } else if (form == s->submenuForm) {
+                s->submenuHelpText = GetDlgItem(form, ID_SUBMENU_HELP_RICH_EDIT);
             }
         }
         s->shortcutHintText = tr(*s, "ConfigShortcutHint");
@@ -2457,14 +2670,32 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         control(*s, L"STATIC", tr(*s, "ConfigIconFolder"), 0, 0, 0, 0, 0, ID_ICON_FOLDER_LABEL);
         s->iconFolderSet = control(*s, L"BUTTON", tr(*s, "ConfigSetFolder"), 0, 0, 0, 0, 0, ID_ICON_FOLDER_SET);
         s->iconFolderOpen = control(*s, L"BUTTON", tr(*s, "ConfigOpenFolder"), 0, 0, 0, 0, 0, ID_ICON_FOLDER_OPEN);
-        s->pathsInfoGroup = control(*s, L"BUTTON", tr(*s, "ConfigPathsInfoTitle"), 0, 0, 0, 0, 0, ID_PATHS_INFO_GROUP);
-        s->pathsInfoBullet1 = control(*s, L"STATIC", L"", 0, 0, 0, 0, 0, ID_PATHS_INFO_BULLET1);
-        s->pathsInfoText = control(*s, L"STATIC", L"", 0, 0, 0, 0, 0, ID_PATHS_INFO_TEXT);
-        s->pathsInfoBullet2 = control(*s, L"STATIC", L"", 0, 0, 0, 0, 0, ID_PATHS_INFO_BULLET2);
-        s->pathsInfoText2 = control(*s, L"STATIC", L"", 0, 0, 0, 0, 0, ID_PATHS_INFO_TEXT2);
+        s->pathsInfoGroup = control(*s, L"BUTTON", tr(*s, "ConfigPathsGroup"), 0, 0, 0, 0, 0, ID_PATHS_INFO_GROUP);
+        s->pathsInfoRichEdit = GetDlgItem(s->settingsForm, ID_PATHS_INFO_RICH_EDIT);
+        s->hideMenuGroup = control(*s, L"BUTTON", tr(*s, "ConfigHideMenusGroup"), 0, 0, 0, 0, 0, ID_HIDE_MENU_GROUP);
+        s->hideEncoding = control(*s, L"BUTTON", tr(*s, "ConfigHideEncoding"), 0, 0, 0, 0, 0, ID_HIDE_ENCODING);
+        s->hideLanguage = control(*s, L"BUTTON", tr(*s, "ConfigHideLanguage"), 0, 0, 0, 0, 0, ID_HIDE_LANGUAGE);
+        s->hideTools = control(*s, L"BUTTON", tr(*s, "ConfigHideTools"), 0, 0, 0, 0, 0, ID_HIDE_TOOLS);
+        s->hideMacro = control(*s, L"BUTTON", tr(*s, "ConfigHideMacro"), 0, 0, 0, 0, 0, ID_HIDE_MACRO);
+        s->hideRun = control(*s, L"BUTTON", tr(*s, "ConfigHideRun"), 0, 0, 0, 0, 0, ID_HIDE_RUN);
+        s->hideMenuRestart = control(*s, L"STATIC", tr(*s, "ConfigHideMenusRestart"), 0, 0, 0, 0, 0, ID_HIDE_MENU_RESTART);
+        loadHideMenuOptions(*s);
         s->controlParent = hwnd;
         s->saveButton = control(*s, L"BUTTON", L"", 0, 0, 0, 0, 0, ID_SAVE_REBUILD);
         if (s->saveButton) SetWindowTextW(s->saveButton, escapeButtonMnemonics(tr(*s, "ConfigSaveRebuild")).c_str());
+        // Let the common-control status bar calculate its own height and dock
+        // to the parent bottom, following the documented Win32 creation pattern.
+        s->statusBar = CreateWindowExW(0, STATUSCLASSNAMEW, L"",
+                                       WS_CHILD | WS_VISIBLE | CCS_BOTTOM,
+                                       0, 0, 0, 0, hwnd,
+                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_EDITOR_STATUS)),
+                                       s->context.module, nullptr);
+        if (s->statusBar) {
+            SendMessageW(s->statusBar, WM_SETFONT, reinterpret_cast<WPARAM>(s->font), FALSE);
+            SendMessageW(s->statusBar, SB_SIMPLE, FALSE, 0);
+            int statusPart[] = {-1};
+            SendMessageW(s->statusBar, SB_SETPARTS, 1, reinterpret_cast<LPARAM>(statusPart));
+        }
         s->workspaceFolder = s->context.workspaceFolder;
         refreshSettingsPaths(*s);
 
@@ -2505,10 +2736,41 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         fillRunIn(*s, L"output_pane");
         s->controlParent = hwnd;
         layoutPageForms(*s);
+        setRichHelpContent(*s, s->scriptHelpText,
+            {{tr(*s, "ConfigScriptHelpRuntime"), s->context.scriptRequirementsUrl},
+             {tr(*s, "ConfigScriptHelpCreate"), s->context.scriptTemplateUrl},
+             {tr(*s, "ConfigScriptHelpApi"), s->context.scriptApiUrl}}, 100);
+        setRichHelpContent(*s, s->actionHelpText,
+            {{tr(*s, "ConfigActionHelpHeading"), L""},
+             {tr(*s, "ConfigActionHelpCurrentFile"), L""},
+             {tr(*s, "ConfigActionHelpStop"), L""},
+             {tr(*s, "ConfigActionHelpMenuCommand"), L""},
+             {tr(*s, "ConfigActionHelpConfigure"), L""}}, 80, 1);
+        setRichHelpContent(*s, s->submenuHelpText,
+            {{tr(*s, "ConfigSubmenuHelp"), L""}}, 0);
         positionHelpLink(*s, GetDlgItem(s->actionForm, ID_ACTION_TARGET_LABEL),
                          GetDlgItem(s->actionForm, ID_ACTION_TARGET),
                          GetDlgItem(s->actionForm, ID_ACTION_HELP));
-        layoutPathsInfo(*s);
+        const std::wstring pathsInfo = tr(*s, "ConfigPathsInfoText");
+        std::vector<std::pair<std::wstring, std::wstring>> pathParagraphs;
+        size_t i = 0;
+        while (i < pathsInfo.size()) {
+            while (i < pathsInfo.size() && (pathsInfo[i] == L'\r' || pathsInfo[i] == L'\n')) ++i;
+            const size_t paragraphStart = i;
+            while (i < pathsInfo.size() && pathsInfo[i] != L'\r' && pathsInfo[i] != L'\n') ++i;
+            if (i > paragraphStart)
+                pathParagraphs.emplace_back(pathsInfo.substr(paragraphStart, i - paragraphStart), L"");
+        }
+        setRichHelpContent(*s, s->pathsInfoRichEdit, pathParagraphs, 100);
+        if (s->pathsInfoRichEdit) {
+            // The path group's sibling controls are created around this rich edit.
+            // Keep the text surface above the group-box frame and repaint it once
+            // after its initial content has been assigned.
+            SetWindowPos(s->pathsInfoRichEdit, HWND_TOP, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            InvalidateRect(s->pathsInfoRichEdit, nullptr, TRUE);
+            UpdateWindow(s->pathsInfoRichEdit);
+        }
         bindItemForm(*s, nullptr);
         s->workspaceFolder = s->context.workspaceFolder;
         refreshSettingsPaths(*s);
@@ -2540,6 +2802,13 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         ShowWindow(hwnd, SW_SHOW);
         SetFocus(s->tree);
         rebuildTree(*s);
+        // Set the opening message after the initial tree has finished building,
+        // because building it can emit selection notifications.
+        if (s->statusBar && !s->context.initialStatus.empty()) {
+            s->statusText = s->context.initialStatus;
+            SendMessageW(s->statusBar, SB_SETTEXTW, SBT_OWNERDRAW, 0);
+            UpdateWindow(s->statusBar);
+        }
         s->dirty = false;
         return FALSE;
     }
@@ -2552,6 +2821,7 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
     if (message == WM_DRAWITEM &&
         drawShortcutClear(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam), s->shortcutClearFont,
                           s->shortcutClearHovered)) return TRUE;
+    if (message == WM_DRAWITEM && drawEditorStatus(*s, *reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) return TRUE;
     if (message == WM_DRAWITEM &&
         drawHelpLink(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) return TRUE;
     if (message == WM_DRAWITEM &&
@@ -2577,7 +2847,25 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
             return TRUE;
         }
     }
+    if (message == WM_NOTIFY) {
+        const auto* header = reinterpret_cast<NMHDR*>(lParam);
+        if (header->code == EN_LINK) {
+            const auto* linkEvent = reinterpret_cast<const ENLINK*>(lParam);
+            const bool activated = linkEvent->msg == WM_LBUTTONUP ||
+                (linkEvent->msg == WM_KEYUP && linkEvent->wParam == VK_RETURN);
+            if (activated) {
+                for (const RichHelpLink& link : s->richHelpLinks) {
+                    if (link.control == header->hwndFrom && linkEvent->chrg.cpMin < link.end &&
+                        linkEvent->chrg.cpMax > link.start && !link.url.empty()) {
+                        ShellExecuteW(hwnd, L"open", link.url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                        return TRUE;
+                    }
+                }
+            }
+        }
+    }
     if (message == WM_NOTIFY && reinterpret_cast<NMHDR*>(lParam)->idFrom == ID_TAB && reinterpret_cast<NMHDR*>(lParam)->code == TCN_SELCHANGE) {
+        clearEditorStatus(*s);
         const int page = static_cast<int>(SendMessageW(s->tab, TCM_GETCURSEL, 0, 0));
         if (s->activePage == 0 && page != 0 && !commitSelected(*s)) {
             SendMessageW(s->tab, TCM_SETCURSEL, s->activePage, 0);
@@ -2602,6 +2890,7 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
     }
     if (message == WM_NOTIFY && reinterpret_cast<NMHDR*>(lParam)->idFrom == ID_TREE && reinterpret_cast<NMHDR*>(lParam)->code == TVN_SELCHANGEDW) {
         if (s->rebuildingTree) return TRUE;
+        clearEditorStatus(*s);
         auto* change = reinterpret_cast<NMTREEVIEWW*>(lParam);
         auto* node = reinterpret_cast<EditorNode*>(change->itemNew.lParam);
         if (!commitSelected(*s)) { MessageBoxW(hwnd, tr(*s, "ConfigDuplicateMenuTitle").c_str(), tr(*s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING); return TRUE; }
@@ -2645,6 +2934,10 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
     }
     if (message == WM_COMMAND) {
         const int id = LOWORD(wParam), notification = HIWORD(wParam);
+        const bool isUserAction = notification == BN_CLICKED || notification == EN_CHANGE ||
+                                  notification == CBN_SELCHANGE || notification == CBN_EDITCHANGE;
+        if (!s->updating && isUserAction && id != ID_SAVE_REBUILD)
+            clearEditorStatus(*s);
         if (id == ID_ACTION_HELP && notification == BN_CLICKED) {
             const std::wstring url = nativeLanguageXmlUrl(s->context.owner);
             ShellExecuteW(hwnd, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -2695,7 +2988,8 @@ static cJSON* loadJson(const std::wstring& path)
 
 } // namespace
 
-MenuConfigEditorResult showMenuConfigEditor(const MenuConfigEditorContext& context)
+MenuConfigEditorResult showMenuConfigEditor(const MenuConfigEditorContext& context,
+                                            std::wstring* statusAfterWorkspaceChange)
 {
     EditorState state;
     state.context = context;
@@ -2725,14 +3019,24 @@ MenuConfigEditorResult showMenuConfigEditor(const MenuConfigEditorContext& conte
         }
     }
 
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_TAB_CLASSES | ICC_TREEVIEW_CLASSES};
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_TAB_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES};
     if (!InitCommonControlsEx(&controls)) {
         cJSON_Delete(state.root);
         MessageBoxW(context.owner, L"Unable to initialize the menu configuration controls.", L"NppMenuScripts", MB_OK | MB_ICONERROR);
         return MenuConfigEditorResult::Closed;
     }
+    HMODULE richEditModule = LoadLibraryW(L"Msftedit.dll");
+    if (!richEditModule) {
+        cJSON_Delete(state.root);
+        MessageBoxW(context.owner, L"Unable to load the Windows Rich Edit control.",
+                    L"NppMenuScripts", MB_OK | MB_ICONERROR);
+        return MenuConfigEditorResult::Closed;
+    }
     const int result = DialogBoxParamW(context.module, MAKEINTRESOURCEW(IDD_MENU_CONFIG), context.owner,
                                        dialogProc, reinterpret_cast<LPARAM>(&state));
+    FreeLibrary(richEditModule);
+    if (statusAfterWorkspaceChange && result == CONFIG_EDITOR_WORKSPACE_CHANGED_RESULT)
+        *statusAfterWorkspaceChange = state.pendingStatus;
     cJSON_Delete(state.root);
     if (result == CONFIG_EDITOR_WORKSPACE_CHANGED_RESULT) return MenuConfigEditorResult::WorkspaceChanged;
     return MenuConfigEditorResult::Closed;
