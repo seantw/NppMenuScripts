@@ -34,6 +34,8 @@
 #include "ScriptExitState.h"
 #include "MenuCommand.h"
 #include "MenuConfigEditor.h"
+#include "HtmlPane.h"
+#include "HtmlSecurity.h"
 extern "C" {
 #include "../third_party/cJSON.h"
 }
@@ -50,6 +52,7 @@ static void showAbout();
 static void runCurrentFile();
 static void openMenuJson();
 static void configureMenu();
+static void showScriptPath(int id, bool checkCtrlClick);
 static void rebuildMenu();
 static bool chooseWorkspaceFolder(HWND owner, std::wstring& statusText);
 static bool openOrCreateScript(const std::wstring& scriptPath, HWND promptOwner = nullptr);
@@ -69,6 +72,9 @@ static std::unordered_map<std::string, std::wstring> g_translations;
 static void debugLog(const std::wstring& message);
 static std::wstring joinPath(std::wstring base, std::wstring relative);
 static bool postOutputMessage(const std::wstring& text, bool isStderr = false);
+static std::wstring handleHtmlWebMessage(const std::wstring& request);
+static HtmlPermissionGrant parseHtmlPermissionGrant(cJSON* item);
+static bool validHtmlPermissionGrantJson(cJSON* item);
 enum class ExecuteRunIn { OutputPane, Console, Windows };
 struct ExecuteOptions {
     std::wstring command;
@@ -100,6 +106,7 @@ static std::vector<std::wstring> g_toolbarScriptFiles;
 static std::vector<MenuCommandAction> g_toolbarActions;
 static std::vector<std::wstring> g_toolbarActionTargets;
 static std::vector<ExecuteOptions> g_toolbarExecuteOptions;
+static std::vector<HtmlPermissionGrant> g_toolbarHtmlPermissions;
 static std::vector<std::wstring> g_toolbarIconFiles;
 static std::vector<std::wstring> g_toolbarTitles;
 static std::vector<toolbarIconsWithDarkMode> g_toolbarIcons;
@@ -117,6 +124,7 @@ static std::vector<std::wstring> g_scriptPaths;
 static std::vector<std::wstring> g_scriptTitles;
 static std::vector<MenuCommandAction> g_scriptActions;
 static std::vector<ExecuteOptions> g_executeOptions;
+static std::vector<HtmlPermissionGrant> g_htmlPermissions;
 static bool g_installed = false;
 static bool g_nppReady = false;
 static bool g_hiddenMainMenusApplied = false;
@@ -370,7 +378,8 @@ static const std::wstring& tr(const char* key)
         {"OutputPane", L"Output Pane"}, {"OpenScriptsFolder", L"Open Scripts Folder"},
         {"ConfigTitle", L"NppMenuScripts - Menu Configuration"}, {"ConfigureMenu", L"Configure Menu..."},
         {"ConfigMenuRoot", L"Menu"},
-        {"ConfigToolbarRoot", L"Toolbar"}, {"ConfigNew", L"New"}, {"ConfigDelete", L"Delete"},
+        {"ConfigToolbarRoot", L"Toolbar"}, {"ConfigNew", L"New"}, {"ConfigRun", L"Run"},
+        {"ConfigDelete", L"Delete"},
         {"ConfigMoveUp", L"Up"}, {"ConfigMoveDown", L"Down"},
         {"ConfigSaveRebuild", L"Save & Rebuild"}, {"ConfigCancel", L"Cancel"}, {"ConfigTitleLabel", L"Title"},
         {"ConfigChangeIcon", L"Change icon..."}, {"ConfigScriptSettings", L"Script Settings"},
@@ -500,14 +509,25 @@ static std::wstring nativeLocaleCode()
     std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     const size_t dot = name.find_last_of('.');
     if (dot != std::string::npos) name.resize(dot);
-    if (name == "taiwanesemandarin" || name == "chinese") return L"zh-TW";
-    if (name == "chinesesimplified") return L"zh-CN";
+    if (name == "taiwanesemandarin" || name == "chinese") return L"zh-tw";
+    if (name == "chinesesimplified") return L"zh-cn";
     if (name == "japanese") return L"ja";
     if (name == "french") return L"fr";
     if (name == "spanish") return L"es";
-    if (name == "portuguese") return L"pt-PT";
-    if (name == "brazilian_portuguese" || name == "brazilianportuguese") return L"pt-BR";
+    if (name == "portuguese") return L"pt-pt";
+    if (name == "brazilian_portuguese" || name == "brazilianportuguese") return L"pt-br";
+    if (name == "german") return L"de";
+    if (name == "korean") return L"ko";
+    if (name == "russian") return L"ru";
+    if (name == "italian") return L"it";
     return L"en";
+}
+
+static std::string normalizeLocaleKey(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
 }
 
 static void loadTranslations()
@@ -531,11 +551,15 @@ static void loadTranslations()
     }
     g_translations.clear();
     const std::wstring effectiveLocale = locale.empty() ? L"en" : locale;
-    const std::string localeUtf8 = effectiveLocale == L"zh-TW" ? "zh-TW" : effectiveLocale == L"zh-CN" ? "zh-CN" :
-                                   effectiveLocale == L"pt-PT" ? "pt-PT" : effectiveLocale == L"pt-BR" ? "pt-BR" :
-                                   effectiveLocale == L"ja" ? "ja" : effectiveLocale == L"fr" ? "fr" : effectiveLocale == L"es" ? "es" : "en";
-    cJSON* english = cJSON_GetObjectItemCaseSensitive(root, "en");
-    cJSON* selected = cJSON_GetObjectItemCaseSensitive(root, localeUtf8.c_str());
+    const std::string localeUtf8 = normalizeLocaleKey(std::string(effectiveLocale.begin(), effectiveLocale.end()));
+    cJSON* english = nullptr;
+    cJSON* selected = nullptr;
+    for (cJSON* localeItem = root->child; localeItem; localeItem = localeItem->next) {
+        if (!localeItem->string || !cJSON_IsObject(localeItem)) continue;
+        const std::string key = normalizeLocaleKey(localeItem->string);
+        if (key == "en") english = localeItem;
+        if (key == localeUtf8) selected = localeItem;
+    }
     for (cJSON* item = english ? english->child : nullptr; item; item = item->next) {
         if (item->string && cJSON_IsString(item) && item->valuestring[0]) g_translations[item->string] = utf8ToWide(item->valuestring);
     }
@@ -742,6 +766,15 @@ static std::wstring resolveScriptFolder(const std::wstring& menuPath, const std:
     return fullPath(joinPath(directoryName(menuPath), configuredFolder));
 }
 
+static bool htmlFolderIndexPath(const std::wstring& folder, std::wstring& indexPath)
+{
+    const DWORD folderAttributes = GetFileAttributesW(folder.c_str());
+    if (folderAttributes == INVALID_FILE_ATTRIBUTES || !(folderAttributes & FILE_ATTRIBUTE_DIRECTORY)) return false;
+    indexPath = joinPath(folder, L"index.html");
+    const DWORD indexAttributes = GetFileAttributesW(indexPath.c_str());
+    return indexAttributes != INVALID_FILE_ATTRIBUTES && !(indexAttributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 static std::wstring notepadPluginConfigDirectory()
 {
     const LRESULT needed = SendMessageW(g_nppData._nppHandle, NPPM_GETPLUGINSCONFIGDIR, 0, 0);
@@ -867,6 +900,23 @@ static bool copyConfiguredFolderFromTemplate(const std::wstring& configuredPath,
     return copyDirectoryMissing(source, joinPath(workspaceDirectory, relative));
 }
 
+static bool copyHtmlProjectsFromTemplate(cJSON* node,
+                                         const std::wstring& workspaceDirectory,
+                                         const std::wstring& templateDirectory)
+{
+    if (!node) return true;
+    if (cJSON_IsObject(node)) {
+        cJSON* html = cJSON_GetObjectItemCaseSensitive(node, "html");
+        if (cJSON_IsString(html) && html->valuestring && html->valuestring[0] &&
+            !copyConfiguredFolderFromTemplate(utf8ToWide(html->valuestring), workspaceDirectory, templateDirectory))
+            return false;
+    }
+    for (cJSON* child = node->child; child; child = child->next) {
+        if (!copyHtmlProjectsFromTemplate(child, workspaceDirectory, templateDirectory)) return false;
+    }
+    return true;
+}
+
 static bool initializeWorkspaceContents(const std::wstring& workspaceDirectory)
 {
     if (workspaceDirectory.empty() || isPathWithinDirectory(moduleDirectory(), workspaceDirectory) ||
@@ -892,8 +942,17 @@ static bool initializeWorkspaceContents(const std::wstring& workspaceDirectory)
 
     const std::wstring scriptFolder = readMenuStringProperty(sourceMenu, "script_folder", L"./script");
     const std::wstring iconFolder = readMenuStringProperty(sourceMenu, "icon_folder", L"./icon");
-    return copyConfiguredFolderFromTemplate(scriptFolder, workspaceDirectory, templateDirectory) &&
-           copyConfiguredFolderFromTemplate(iconFolder, workspaceDirectory, templateDirectory);
+    if (!copyConfiguredFolderFromTemplate(scriptFolder, workspaceDirectory, templateDirectory) ||
+        !copyConfiguredFolderFromTemplate(iconFolder, workspaceDirectory, templateDirectory)) return false;
+
+    std::ifstream file(sourceMenu.c_str(), std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (bytes.size() >= 3 && static_cast<unsigned char>(bytes[0]) == 0xEF &&
+        static_cast<unsigned char>(bytes[1]) == 0xBB && static_cast<unsigned char>(bytes[2]) == 0xBF) bytes.erase(0, 3);
+    cJSON* root = bytes.empty() ? nullptr : cJSON_Parse(bytes.c_str());
+    const bool copiedHtml = root && copyHtmlProjectsFromTemplate(root, workspaceDirectory, templateDirectory);
+    if (root) cJSON_Delete(root);
+    return copiedHtml;
 }
 
 static std::wstring settingsFilePath()
@@ -1247,6 +1306,7 @@ static void configureMenu()
     MenuConfigEditorContext context;
     context.owner = g_nppData._nppHandle;
     context.module = g_hModule;
+    context.settingsFilePath = settingsFilePath();
     context.translate = [](const char* key) { return tr(key); };
     const std::wstring locale = nativeLocaleCode();
     context.placeholdersUrl = (locale == L"zh-TW" || locale == L"zh-CN")
@@ -1259,8 +1319,13 @@ static void configureMenu()
     context.scriptRequirementsUrl = readme + (chineseReadme ? L"#系統需求" : L"#requirements");
     context.scriptTemplateUrl = readme + (chineseReadme ? L"#api-參考" : L"#api-reference");
     context.scriptApiUrl = readme + (chineseReadme ? L"#腳本語言" : L"#script-languages");
+    context.htmlPermissionsUrl = readme;
     context.chooseWorkspaceFolder = chooseWorkspaceFolder;
     context.openOrCreateScript = [](HWND owner, const std::wstring& path) { return openOrCreateScript(path, owner); };
+    context.runSelectedItem = [](size_t index) {
+        if (index < g_scriptPaths.size())
+            showScriptPath(g_cmdBase + static_cast<int>(index), false);
+    };
     context.validate = [](cJSON* root, std::wstring& error) {
         cJSON* scriptFolder = cJSON_GetObjectItemCaseSensitive(root, "script_folder");
         cJSON* menu = cJSON_GetObjectItemCaseSensitive(root, "menu");
@@ -1297,14 +1362,22 @@ static void configureMenu()
             cJSON* script = cJSON_GetObjectItemCaseSensitive(item, "script");
             cJSON* action = cJSON_GetObjectItemCaseSensitive(item, "action");
             cJSON* execute = cJSON_GetObjectItemCaseSensitive(item, "execute");
+            cJSON* html = cJSON_GetObjectItemCaseSensitive(item, "html");
             if (!cJSON_IsString(title) || !title->valuestring || !title->valuestring[0] ||
-                !hasExactlyOneExecutionTarget(script != nullptr, action != nullptr, execute != nullptr)) {
+                !hasExactlyOneExecutionTarget(script != nullptr, action != nullptr, execute != nullptr,
+                                              html != nullptr)) {
                 error = tr("InvalidToolbarEntry");
                 return false;
             }
             if (script && (!cJSON_IsString(script) || !hasScriptExtension(utf8ToWide(script->valuestring)))) {
                 error = tr("InvalidToolbarEntry");
                 return false;
+            }
+            if (html) {
+                if (!cJSON_IsString(html) || !html->valuestring) {
+                    error = tr("InvalidToolbarEntry");
+                    return false;
+                }
             }
             if (action) {
                 MenuCommandAction parsed{};
@@ -2972,6 +3045,104 @@ static bool replaceEntireText(const std::wstring& text)
     return true;
 }
 
+static bool getClipboardUnicodeText(std::wstring& text)
+{
+    text.clear();
+    if (!OpenClipboard(g_nppData._nppHandle)) return false;
+    HANDLE data = GetClipboardData(CF_UNICODETEXT);
+    if (data) {
+        const wchar_t* clipboardText = static_cast<const wchar_t*>(GlobalLock(data));
+        if (clipboardText) {
+            text.assign(clipboardText);
+            GlobalUnlock(data);
+        }
+    }
+    CloseClipboard();
+    return true;
+}
+
+static bool setClipboardUnicodeText(const std::wstring& text)
+{
+    const SIZE_T bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!memory) return false;
+    wchar_t* buffer = static_cast<wchar_t*>(GlobalLock(memory));
+    if (!buffer) {
+        GlobalFree(memory);
+        return false;
+    }
+    memcpy(buffer, text.c_str(), bytes);
+    GlobalUnlock(memory);
+    bool success = false;
+    if (OpenClipboard(g_nppData._nppHandle)) {
+        if (EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, memory)) {
+            success = true;
+            memory = nullptr;
+        }
+        CloseClipboard();
+    }
+    if (memory) GlobalFree(memory);
+    return success;
+}
+
+static std::wstring handleHtmlWebMessage(const std::wstring& request)
+{
+    const std::string requestUtf8 = debugWideToUtf8(request);
+    cJSON* message = requestUtf8.empty() ? nullptr : cJSON_Parse(requestUtf8.c_str());
+    cJSON* id = cJSON_GetObjectItemCaseSensitive(message, "id");
+    cJSON* methodItem = cJSON_GetObjectItemCaseSensitive(message, "method");
+    cJSON* valueItem = cJSON_GetObjectItemCaseSensitive(message, "value");
+    if (!cJSON_IsNumber(id) || !cJSON_IsString(methodItem) || !methodItem->valuestring) {
+        if (message) cJSON_Delete(message);
+        return L"";
+    }
+
+    const std::wstring method = utf8ToWide(methodItem->valuestring);
+    const std::wstring value = cJSON_IsString(valueItem) && valueItem->valuestring
+        ? utf8ToWide(valueItem->valuestring) : L"";
+    bool ok = true;
+    bool booleanResult = false;
+    bool isBoolean = false;
+    std::wstring stringResult;
+    if (method == L"getText") stringResult = getEntireText();
+    else if (method == L"getSelection") stringResult = getSelectionText();
+    else if (method == L"getClipBoard") {
+        if (!getClipboardUnicodeText(stringResult)) ok = false;
+    } else if (method == L"setText") {
+        isBoolean = true;
+        booleanResult = replaceEntireText(value);
+        ok = booleanResult;
+    } else if (method == L"setSelection") {
+        isBoolean = true;
+        booleanResult = replaceSelectionText(value);
+        ok = booleanResult;
+    } else if (method == L"setClipBoard") {
+        isBoolean = true;
+        booleanResult = setClipboardUnicodeText(value);
+        ok = booleanResult;
+    } else {
+        ok = false;
+    }
+
+    cJSON* response = cJSON_CreateObject();
+    if (response) {
+        cJSON_AddNumberToObject(response, "id", id->valuedouble);
+        cJSON_AddBoolToObject(response, "ok", ok);
+        if (ok) {
+            if (isBoolean) cJSON_AddBoolToObject(response, "value", booleanResult);
+            else cJSON_AddStringToObject(response, "value", debugWideToUtf8(stringResult).c_str());
+        } else {
+            cJSON_AddStringToObject(response, "error", "NppMenuScripts API request failed");
+        }
+    }
+    char* responseUtf8 = response ? cJSON_PrintUnformatted(response) : nullptr;
+    const std::wstring responseWide = responseUtf8 ? utf8ToWide(responseUtf8) : L"";
+    if (responseUtf8) cJSON_free(responseUtf8);
+    if (response) cJSON_Delete(response);
+    cJSON_Delete(message);
+    return responseWide;
+}
+
 static bool handleTextProtocolLine(const std::string& line)
 {
     auto splitPayload = [&](const std::string& prefix, std::string& payload) -> bool {
@@ -3103,20 +3274,10 @@ static bool handleClipboardProtocolLine(const std::string& line)
         }
 
         std::wstring text;
-        if (!OpenClipboard(g_nppData._nppHandle)) {
+        if (!getClipboardUnicodeText(text)) {
             writeProtocolResponse("ERROR\n");
             return true;
         }
-
-        HANDLE data = GetClipboardData(CF_UNICODETEXT);
-        if (data) {
-            const wchar_t* clipboardText = static_cast<const wchar_t*>(GlobalLock(data));
-            if (clipboardText) {
-                text.assign(clipboardText);
-                GlobalUnlock(data);
-            }
-        }
-        CloseClipboard();
         writeProtocolResponse("OK:" + encodeBase64(debugWideToUtf8(text)) + "\n");
         return true;
     }
@@ -3130,31 +3291,7 @@ static bool handleClipboardProtocolLine(const std::string& line)
         }
 
         const std::wstring text = utf8ToWide(decoded.c_str());
-        const SIZE_T bytes = (text.size() + 1) * sizeof(wchar_t);
-        HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if (!memory) {
-            writeProtocolResponse("ERROR\n");
-            return true;
-        }
-
-        wchar_t* buffer = static_cast<wchar_t*>(GlobalLock(memory));
-        if (!buffer) {
-            GlobalFree(memory);
-            writeProtocolResponse("ERROR\n");
-            return true;
-        }
-        memcpy(buffer, text.c_str(), bytes);
-        GlobalUnlock(memory);
-
-        bool success = false;
-        if (OpenClipboard(g_nppData._nppHandle)) {
-            if (EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, memory)) {
-                success = true;
-                memory = nullptr; // The system owns the handle after SetClipboardData succeeds.
-            }
-            CloseClipboard();
-        }
-        if (memory) GlobalFree(memory);
+        const bool success = setClipboardUnicodeText(text);
         writeProtocolResponse(success ? "OK\n" : "ERROR\n");
         return true;
     }
@@ -4519,8 +4656,63 @@ static bool prepareCurrentFileScript(std::wstring& scriptPath)
     return true;
 }
 
+static bool openHtmlEntry(size_t index)
+{
+    if (index >= g_scriptActions.size() || index >= g_scriptPaths.size() ||
+        index >= g_htmlPermissions.size() || g_scriptActions[index] != MenuCommandAction::OpenHtml)
+        return false;
+
+    std::wstring indexPath;
+    if (!htmlFolderIndexPath(g_scriptPaths[index], indexPath)) {
+        MessageBoxW(g_nppData._nppHandle, tr("ConfigHtmlIndexMissing").c_str(),
+                    L"NppMenuScripts", MB_OK | MB_ICONWARNING);
+        return true;
+    }
+
+    const HtmlPermissionGrant& grant = g_htmlPermissions[index];
+    const std::wstring htmlFolder = canonicalHtmlFolderPath(g_scriptPaths[index]);
+    const bool advancedPermissions = grant.enabled() &&
+        validateHtmlPermissionGrant(htmlFolder, grant);
+    if (grant.enabled() && !advancedPermissions) {
+        // Do not leave a previously authorized page running with its NPP
+        // bridge after the project no longer matches its saved grant.
+        closeHtmlPane();
+        MessageBoxW(g_nppData._nppHandle, tr("HtmlPermissionsChanged").c_str(),
+                    L"NppMenuScripts", MB_OK | MB_ICONWARNING);
+        return true;
+    }
+    if (!openHtmlPane(g_nppData._nppHandle, g_hModule, indexPath,
+                      g_scriptTitles[index], advancedPermissions, handleHtmlWebMessage)) {
+        MessageBoxW(g_nppData._nppHandle, tr("HtmlPaneOpenFailed").c_str(),
+                    L"NppMenuScripts", MB_OK | MB_ICONERROR);
+    }
+    return true;
+}
+
+static bool runHtmlProjectForCurrentFile(const std::wstring& currentPath)
+{
+    // If the active document belongs to a configured HTML project, launch that
+    // project's entry point. Prefer the most specific folder when projects nest.
+    size_t match = g_scriptPaths.size();
+    size_t matchLength = 0;
+    for (size_t i = 0; i < g_scriptActions.size() && i < g_scriptPaths.size(); ++i) {
+        if (g_scriptActions[i] != MenuCommandAction::OpenHtml ||
+            !isPathWithinDirectory(g_scriptPaths[i], currentPath))
+            continue;
+        const size_t folderLength = fullPath(g_scriptPaths[i]).size();
+        if (match == g_scriptPaths.size() || folderLength > matchLength) {
+            match = i;
+            matchLength = folderLength;
+        }
+    }
+    return match != g_scriptPaths.size() && openHtmlEntry(match);
+}
+
 static void runCurrentFile()
 {
+    const std::wstring currentPath = getCurrentFilePath();
+    if (!currentPath.empty() && runHtmlProjectForCurrentFile(currentPath)) return;
+
     std::wstring scriptPath;
     if (!prepareCurrentFileScript(scriptPath)) return;
     runNodeScript(scriptPath, fileNameFromPath(scriptPath));
@@ -4538,6 +4730,35 @@ static void showScriptPath(int id, bool checkCtrlClick = true)
     }
     if (action == MenuCommandAction::ConfigureMenu) {
         configureMenu();
+        return;
+    }
+    // Ctrl+click opens the configured source file in Notepad++ instead of
+    // running it. HTML entries use the same behavior as script entries.
+    if (checkCtrlClick && (GetKeyState(VK_CONTROL) & 0x8000) != 0 &&
+        (action == MenuCommandAction::RunScript || action == MenuCommandAction::OpenHtml)) {
+        const std::wstring& sourcePath = g_scriptPaths[static_cast<size_t>(index)];
+        if (action == MenuCommandAction::OpenHtml) {
+            std::wstring indexPath;
+            if (!htmlFolderIndexPath(sourcePath, indexPath)) {
+                MessageBoxW(g_nppData._nppHandle, tr("ConfigHtmlIndexMissing").c_str(),
+                            L"NppMenuScripts", MB_OK | MB_ICONWARNING);
+            } else {
+                SendMessageW(g_nppData._nppHandle, NPPM_DOOPEN, 0,
+                             reinterpret_cast<LPARAM>(indexPath.c_str()));
+            }
+        } else {
+            const DWORD attrs = GetFileAttributesW(sourcePath.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                SendMessageW(g_nppData._nppHandle, NPPM_DOOPEN, 0,
+                             reinterpret_cast<LPARAM>(sourcePath.c_str()));
+            } else {
+                openOrCreateScript(sourcePath);
+            }
+        }
+        return;
+    }
+    if (action == MenuCommandAction::OpenHtml) {
+        openHtmlEntry(static_cast<size_t>(index));
         return;
     }
 
@@ -4567,15 +4788,11 @@ static void showScriptPath(int id, bool checkCtrlClick = true)
     std::wstring scriptPath = g_scriptPaths[static_cast<size_t>(index)];
     const bool currentFile = action == MenuCommandAction::RunCurrentFile;
 
-    if (currentFile && !prepareCurrentFileScript(scriptPath)) return;
-
-    // Hidden shortcut: Ctrl+click a script menu item opens the script in Notepad++
-    // instead of executing it.
-    if (action == MenuCommandAction::RunScript && checkCtrlClick &&
-        (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
-        openOrCreateScript(scriptPath);
-        return;
+    if (currentFile) {
+        const std::wstring currentPath = getCurrentFilePath();
+        if (!currentPath.empty() && runHtmlProjectForCurrentFile(currentPath)) return;
     }
+    if (currentFile && !prepareCurrentFileScript(scriptPath)) return;
 
     const DWORD attrs = GetFileAttributesW(scriptPath.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -4694,10 +4911,11 @@ static bool addMenuItem(HMENU menu, const std::wstring& title, const std::wstrin
     g_scriptPaths.push_back(path);
     g_scriptActions.push_back(action);
     g_executeOptions.emplace_back();
+    g_htmlPermissions.emplace_back();
     g_scriptTitles.push_back(titleWithoutShortcut(title));
     g_cmdIds.push_back(id);
     if (!AppendMenuW(menu, MF_STRING, static_cast<UINT_PTR>(id), title.c_str())) {
-        g_scriptPaths.pop_back(); g_scriptActions.pop_back(); g_executeOptions.pop_back();
+        g_scriptPaths.pop_back(); g_scriptActions.pop_back(); g_executeOptions.pop_back(); g_htmlPermissions.pop_back();
         g_scriptTitles.pop_back(); g_cmdIds.pop_back(); return false;
     }
     registerHotkeyForItem(title, id);
@@ -4972,6 +5190,45 @@ static bool parseExecuteOptions(cJSON* item, ExecuteOptions& options)
     return true;
 }
 
+static bool validHtmlPermissionGrantJson(cJSON* item)
+{
+    cJSON* permissions = cJSON_GetObjectItemCaseSensitive(item, "html_permissions");
+    if (!permissions) return true;
+    if (!cJSON_IsObject(permissions)) return false;
+    cJSON* mode = cJSON_GetObjectItemCaseSensitive(permissions, "mode");
+    cJSON* folder = cJSON_GetObjectItemCaseSensitive(permissions, "folder");
+    cJSON* digest = cJSON_GetObjectItemCaseSensitive(permissions, "sha256");
+    if (!cJSON_IsString(mode) || !mode->valuestring || !cJSON_IsString(folder) ||
+        !folder->valuestring || !folder->valuestring[0]) return false;
+    if (std::strcmp(mode->valuestring, "reconfirm") == 0) {
+        if (!cJSON_IsString(digest) || !digest->valuestring || std::strlen(digest->valuestring) != 64)
+            return false;
+        for (const char* p = digest->valuestring; *p; ++p)
+            if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')))
+                return false;
+        return true;
+    }
+    if (std::strcmp(mode->valuestring, "trust_folder") == 0)
+        return !digest || (cJSON_IsString(digest) && digest->valuestring && !digest->valuestring[0]);
+    return false;
+}
+
+static HtmlPermissionGrant parseHtmlPermissionGrant(cJSON* item)
+{
+    HtmlPermissionGrant grant;
+    cJSON* permissions = cJSON_GetObjectItemCaseSensitive(item, "html_permissions");
+    if (!permissions) return grant;
+    if (!validHtmlPermissionGrantJson(item)) {
+        grant.mode = L"invalid";
+        return grant;
+    }
+    grant.mode = utf8ToWide(cJSON_GetObjectItemCaseSensitive(permissions, "mode")->valuestring);
+    grant.folder = utf8ToWide(cJSON_GetObjectItemCaseSensitive(permissions, "folder")->valuestring);
+    cJSON* digest = cJSON_GetObjectItemCaseSensitive(permissions, "sha256");
+    if (cJSON_IsString(digest)) grant.sha256 = utf8ToWide(digest->valuestring);
+    return grant;
+}
+
 static bool addJsonMenu(HMENU menu, cJSON* obj, const std::wstring& folder, unsigned int depth = 0)
 {
     if (!cJSON_IsArray(obj) || depth > MAX_MENU_NESTING) return false;
@@ -4983,11 +5240,12 @@ static bool addJsonMenu(HMENU menu, cJSON* obj, const std::wstring& folder, unsi
         }
         cJSON* titleItem = cJSON_GetObjectItemCaseSensitive(item, "title");
         cJSON* scriptItem = cJSON_GetObjectItemCaseSensitive(item, "script");
+        cJSON* htmlItem = cJSON_GetObjectItemCaseSensitive(item, "html");
         cJSON* actionItem = cJSON_GetObjectItemCaseSensitive(item, "action");
         cJSON* executeItem = cJSON_GetObjectItemCaseSensitive(item, "execute");
         cJSON* subItem = cJSON_GetObjectItemCaseSensitive(item, "sub");
         if (subItem) {
-            if (!cJSON_IsString(titleItem) || !cJSON_IsArray(subItem) || scriptItem || actionItem || executeItem ||
+            if (!cJSON_IsString(titleItem) || !cJSON_IsArray(subItem) || scriptItem || htmlItem || actionItem || executeItem ||
                 depth >= MAX_MENU_NESTING)
                 return false;
             HMENU childMenu = CreatePopupMenu();
@@ -5004,13 +5262,20 @@ static bool addJsonMenu(HMENU menu, cJSON* obj, const std::wstring& folder, unsi
             continue;
         }
         if (!cJSON_IsString(titleItem) ||
-            !hasExactlyOneExecutionTarget(scriptItem != nullptr, actionItem != nullptr, executeItem != nullptr)) return false;
+            static_cast<unsigned int>(scriptItem != nullptr) + static_cast<unsigned int>(htmlItem != nullptr) +
+                static_cast<unsigned int>(actionItem != nullptr) + static_cast<unsigned int>(executeItem != nullptr) != 1) return false;
         if (scriptItem) {
             if (!cJSON_IsString(scriptItem)) return false;
             const std::wstring script = utf8ToWide(scriptItem->valuestring);
             if (!hasScriptExtension(script) ||
                 !addMenuItem(menu, utf8ToWide(titleItem->valuestring),
                              joinPath(folder, script), MenuCommandAction::RunScript)) return false;
+        } else if (htmlItem) {
+            if (!cJSON_IsString(htmlItem)) return false;
+            const std::wstring htmlFolder = utf8ToWide(htmlItem->valuestring);
+            if (htmlFolder.empty() || !addMenuItem(menu, utf8ToWide(titleItem->valuestring),
+                                                   joinPath(g_workspaceFolder, htmlFolder), MenuCommandAction::OpenHtml)) return false;
+            g_htmlPermissions.back() = parseHtmlPermissionGrant(item);
         } else if (actionItem) {
             if (!cJSON_IsString(actionItem)) return false;
             MenuCommandAction action{};
@@ -5036,19 +5301,24 @@ static bool validMenuItems(cJSON* items, unsigned int depth = 0)
         if (!item->child) continue; // Empty object is a separator.
         cJSON* title = cJSON_GetObjectItemCaseSensitive(item, "title");
         cJSON* script = cJSON_GetObjectItemCaseSensitive(item, "script");
+        cJSON* html = cJSON_GetObjectItemCaseSensitive(item, "html");
         cJSON* actionItem = cJSON_GetObjectItemCaseSensitive(item, "action");
         cJSON* executeItem = cJSON_GetObjectItemCaseSensitive(item, "execute");
         cJSON* sub = cJSON_GetObjectItemCaseSensitive(item, "sub");
         if (sub) {
-            if (!cJSON_IsString(title) || !cJSON_IsArray(sub) || script || actionItem || executeItem ||
+            if (!cJSON_IsString(title) || !cJSON_IsArray(sub) || script || html || actionItem || executeItem ||
                 depth >= MAX_MENU_NESTING ||
                 !validMenuItems(sub, depth + 1)) return false;
             continue;
         }
         if (!cJSON_IsString(title) ||
-            !hasExactlyOneExecutionTarget(script != nullptr, actionItem != nullptr, executeItem != nullptr)) return false;
+            static_cast<unsigned int>(script != nullptr) + static_cast<unsigned int>(html != nullptr) +
+                static_cast<unsigned int>(actionItem != nullptr) + static_cast<unsigned int>(executeItem != nullptr) != 1) return false;
         if (script) {
             if (!cJSON_IsString(script) || !hasScriptExtension(utf8ToWide(script->valuestring))) return false;
+        } else if (html) {
+            if (!cJSON_IsString(html) || !html->valuestring || !html->valuestring[0] ||
+                !validHtmlPermissionGrantJson(item)) return false;
         } else if (actionItem) {
             MenuCommandAction action{};
             std::wstring target;
@@ -5185,6 +5455,7 @@ static void removeMenus()
     DrawMenuBar(g_nppData._nppHandle);
     g_topMenus.clear(); g_mainMenu = nullptr;
     g_scriptPaths.clear(); g_scriptActions.clear(); g_scriptTitles.clear(); g_executeOptions.clear();
+    g_htmlPermissions.clear();
     g_cmdIds.clear(); g_cmdBase = 0; g_cmdCount = 0; g_installed = false;
     destroyHotkeyWindow();
 }
@@ -5246,6 +5517,7 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
     std::vector<MenuCommandAction> configuredToolbarActions;
     std::vector<std::wstring> configuredToolbarActionTargets;
     std::vector<ExecuteOptions> configuredToolbarExecuteOptions;
+    std::vector<HtmlPermissionGrant> configuredToolbarHtmlPermissions;
     std::vector<std::wstring> configuredToolbarIcons;
     std::vector<std::wstring> configuredToolbarTitles;
     if (toolbarItem) {
@@ -5254,11 +5526,12 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
             cJSON* scriptItem = cJSON_GetObjectItemCaseSensitive(item, "script");
             cJSON* actionItem = cJSON_GetObjectItemCaseSensitive(item, "action");
             cJSON* executeItem = cJSON_GetObjectItemCaseSensitive(item, "execute");
+            cJSON* htmlItem = cJSON_GetObjectItemCaseSensitive(item, "html");
             cJSON* titleItem = cJSON_GetObjectItemCaseSensitive(item, "title");
             if (!cJSON_IsObject(item) || (iconItem && !cJSON_IsString(iconItem)) ||
                 !cJSON_IsString(titleItem) ||
                 !hasExactlyOneExecutionTarget(scriptItem != nullptr, actionItem != nullptr,
-                                              executeItem != nullptr)) {
+                                              executeItem != nullptr, htmlItem != nullptr)) {
                 cJSON_Delete(root);
                 MessageBoxW(g_nppData._nppHandle, tr("InvalidToolbarEntry").c_str(), L"NppMenuScripts", MB_OK | MB_ICONERROR);
                 return false;
@@ -5284,6 +5557,8 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
                 cJSON_Delete(root);
                 MessageBoxW(g_nppData._nppHandle, tr("InvalidToolbarEntry").c_str(), L"NppMenuScripts", MB_OK | MB_ICONERROR);
                 return false;
+            } else if (actionItem) {
+                configuredToolbarExecuteOptions.emplace_back();
             } else if (executeItem) {
                 ExecuteOptions options;
                 if (!parseExecuteOptions(executeItem, options)) {
@@ -5293,9 +5568,27 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
                 }
                 action = MenuCommandAction::RunCommand;
                 configuredToolbarExecuteOptions.push_back(std::move(options));
+            } else if (htmlItem) {
+                if (!cJSON_IsString(htmlItem) || !htmlItem->valuestring ||
+                    !validHtmlPermissionGrantJson(item)) {
+                    cJSON_Delete(root);
+                    MessageBoxW(g_nppData._nppHandle, tr("InvalidToolbarEntry").c_str(), L"NppMenuScripts", MB_OK | MB_ICONERROR);
+                    return false;
+                }
+                const std::wstring htmlFolder = utf8ToWide(htmlItem->valuestring);
+                if (htmlFolder.empty()) {
+                    cJSON_Delete(root);
+                    MessageBoxW(g_nppData._nppHandle, tr("InvalidToolbarEntry").c_str(), L"NppMenuScripts", MB_OK | MB_ICONERROR);
+                    return false;
+                }
+                script = htmlFolder;
+                action = MenuCommandAction::OpenHtml;
+                configuredToolbarExecuteOptions.emplace_back();
+                configuredToolbarHtmlPermissions.push_back(parseHtmlPermissionGrant(item));
             } else {
                 configuredToolbarExecuteOptions.emplace_back();
             }
+            if (!htmlItem) configuredToolbarHtmlPermissions.emplace_back();
             std::wstring iconPath;
             if (iconItem) {
                 const std::wstring iconName = utf8ToWide(iconItem->valuestring);
@@ -5343,6 +5636,7 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
          configuredToolbarActions != g_toolbarActions ||
          configuredToolbarActionTargets != g_toolbarActionTargets ||
          configuredToolbarExecuteOptions != g_toolbarExecuteOptions ||
+         configuredToolbarHtmlPermissions != g_toolbarHtmlPermissions ||
          configuredToolbarIcons != g_toolbarIconFiles ||
          configuredToolbarTitles != g_toolbarTitles);
     // g_hiddenMainMenuIds records the list applied at startup. Since hiding is
@@ -5354,6 +5648,7 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
         g_toolbarActions = configuredToolbarActions;
         g_toolbarActionTargets = configuredToolbarActionTargets;
         g_toolbarExecuteOptions = configuredToolbarExecuteOptions;
+        g_toolbarHtmlPermissions = configuredToolbarHtmlPermissions;
         g_toolbarIconFiles = configuredToolbarIcons;
         g_toolbarTitles = configuredToolbarTitles;
         g_toolbarIcons.resize(g_toolbarScriptFiles.size());
@@ -5424,10 +5719,12 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
         const std::wstring& script = g_toolbarScriptFiles[i];
         const MenuCommandAction action = g_toolbarActions[i];
         g_scriptPaths.push_back(action == MenuCommandAction::RunScript ? joinPath(folder, script) :
+                                action == MenuCommandAction::OpenHtml ? joinPath(g_workspaceFolder, script) :
                                 action == MenuCommandAction::RunMenuCommand ? g_toolbarActionTargets[i] : L"");
         g_scriptActions.push_back(action);
         g_scriptTitles.push_back(titleWithoutShortcut(g_toolbarTitles[i]));
         g_executeOptions.push_back(g_toolbarExecuteOptions[i]);
+        g_htmlPermissions.push_back(g_toolbarHtmlPermissions[i]);
         const int commandId = g_cmdBase + static_cast<int>(g_scriptPaths.size()) - 1;
         g_cmdIds.push_back(commandId);
         registerHotkeyForItem(g_toolbarTitles[i], commandId);
@@ -5488,6 +5785,11 @@ extern "C" __declspec(dllexport) FuncItem* getFuncsArray(int* nbF)
 
 extern "C" __declspec(dllexport) void beNotified(SCNotification* notifyCode)
 {
+    if (notifyCode && notifyCode->nmhdr.code == DMN_CLOSE &&
+        isHtmlPaneCloseNotification(notifyCode->nmhdr.hwndFrom, notifyCode->nmhdr.idFrom)) {
+        closeHtmlPane();
+        return;
+    }
     if (notifyCode && notifyCode->nmhdr.code == NPPN_READY) {
         g_nppReady = true;
         loadTranslations();
@@ -5544,6 +5846,7 @@ extern "C" __declspec(dllexport) void beNotified(SCNotification* notifyCode)
         return;
     }
     if (notifyCode && notifyCode->nmhdr.code == NPPN_SHUTDOWN) {
+        closeHtmlPane();
         removePluginMenuMessageHook();
         removeHotkeyMessageHook();
         g_shuttingDown.store(true);

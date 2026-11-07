@@ -10,7 +10,7 @@ NppMenuScripts 是 Notepad++ 的 x64 外掛程式。它可讓您自訂「選單�
 - 可自行配置「選單」或「工具列」，並指定其「執行動作」。
 - 選單支援多層巢狀子選單。最多 16 層子選單 (不含根層)。
 - 工具列按鈕可自定圖示。最多 32 個。
-- 「執行動作」分三類，包括：
+- 「執行動作」分四類，包括：
   - **腳本語言**：目前支援三種腳本語言。並提供 JavaScript、Python 及 Perl 的 Helper API 模組，可與編輯中的文件互動。即使未使用 Helper API，一般腳本的 `stdout` 和 `stderr` 也會直接顯示在「輸出面板」。支援基本 ANSI 色彩控制碼。
   - **外掛內建動作**：目前支援兩種動作。「執行目前編輯器中的腳本」與「停止執行中的腳本」。
   - **外部程式 (命令列)**：
@@ -19,6 +19,7 @@ NppMenuScripts 是 Notepad++ 的 x64 外掛程式。它可讓您自訂「選單�
     - 可設定「輸出面板」的文字編碼。
     - 可透過命令列參數傳入路徑及檔名相關之變數。
     - 可設定執行前的環境變數。除了可帶入路徑及檔名相關變數外，還可帶入目前文件部分內容變數。
+  - **HTML 專案**：在可停靠的 WebView2 面板中載入 HTML 專案。
 - 腳本以獨立程序執行；執行結束後，程序隨即關閉並釋放其資源。沒有執行腳本時，不會有常駐的腳本執行環境。關閉 Notepad++ 時也會清理正在執行的腳本程序。
 - 支援多國語言介面。
 
@@ -26,6 +27,7 @@ NppMenuScripts 是 Notepad++ 的 x64 外掛程式。它可讓您自訂「選單�
 
 - Windows x64
 - Notepad++ x64
+- 若使用 HTML 專案，需有 Microsoft Edge WebView2 Runtime。Windows 11 已內建；其他 Windows 版本可能已安裝。若未安裝，請至 [Microsoft WebView2 頁面](https://developer.microsoft.com/en-us/microsoft-edge/webview2/)下載安裝。
 - 若使用 JavaScript 需安裝 [Node.js® for Windows](https://nodejs.org/en/download/)
 - 若使用 Python 需安裝 [Python for Windows](https://www.python.org/downloads/windows/)
 - 若使用 Perl 需安裝 [Strawberry Perl for Windows](https://strawberryperl.com/)
@@ -121,7 +123,7 @@ Notepad++\
 - 選單分隔線使用空物件 `{}`。
 - 每個「選單」與「工具」項目必需指定 `title` 及「執行動作」：
   - `title`：(必要)「選單標題」或「工具列按鈕」的提示 (Tooltip)。若要設定快捷鍵，可加上 **Tab 字元** `\t` 和鍵盤快捷鍵名稱。
-  - 執行動作 (必要) 有 `script`、`action` 或 `execute` 三種，只能指定其中一項：
+  - 執行動作 (必要) 有 `script`、`action`、`execute` 或 `html` 四種，只能指定其中一項：
     - `script`：值為字串，相對於 `script_folder` 的腳本檔案路徑，或絕對路徑。副檔名支援 `.js`、`.mjs`、`.py`、`.pl`。
     - `action` 值為字串，可設定外掛內建動作或 Notepad++ 選單指令。目前有三種：
       - `"RUN_CURRENT_FILE"` 代表執行目前編輯中的腳本。
@@ -145,6 +147,7 @@ Notepad++\
         - `{SCRIPT_FOLDER}`：`script_folder` 設定的腳本資料夾完整路徑
         - `{LINE_TEXT}`：游標所在整列文字 (僅`env`可使用)
         - `{SELECT_TEXT}`：選取文字 (僅`env`可使用)
+    - `html`：HTML 專案資料夾路徑，資料夾內必須包含 `index.html`。可使用相對於 `menu.json` 所在資料夾的路徑，或完整路徑。
   - `icon`：工具列按鈕圖示檔 .ico。尺寸為 32×32 像素、具備 32 位元色彩深度 (支援全彩與透明度)。僅在 `toolbar` 內有作用。
   - `sub`：子選單項目陣列，可包含子選單或腳本項目。僅在 `menu` 內有作用。
 
@@ -183,7 +186,6 @@ Notepad++\
 快捷鍵必須至少包含一個修飾鍵，例如 `Ctrl+1`、`Alt+F8` 或 `Shift+Tab`；單獨的 `Tab` 不會註冊。快捷鍵透過 Windows `RegisterHotKey` 註冊，如果組合已被 Windows 或其他程式占用，就可能無法使用。
 
 **Access Keys**：按下 Alt 鍵，搭配根層選單名稱 & 符號後的英文字母 (通常會出現底線)，即可打開該選單。
-
 
 ## 腳本語言
 
@@ -304,6 +306,38 @@ NppMenuScripts 會將外掛資料夾加入 Perl 模組搜尋路徑，讓 Perl �
 - 各腳本語言的 Helper API 為同步呼叫 (Synchronous)。僅 JavaScript 另外提供非同步呼叫 (Asynchronous)。
 - 參數中的檔案路徑分隔字元 `\` 及 `/` 皆通用。在字串中若要使用 `\` 記得跳脫，像這樣 `\\`。
 
+
+## HTML 專案
+
+HTML 項目會在可停靠的 WebView2 面板中載入包含 `index.html` 的專案資料夾：
+
+```json
+{ "title": "My HTML Tool", "html": "./html/my-tool" }
+```
+
+### JavaScript API
+
+為 HTML 資料夾開啟進階權限後，網頁可使用非同步 `npp` API 與目前的 Notepad++ 文件及剪貼簿互動：
+
+```js
+const text = await npp.getText();
+const selectedText = await npp.getSelection();
+await npp.setSelection("replacement");
+```
+
+可用方法：`getText()`、`setText(text)`、`getSelection()`、`setSelection(text)`、`getClipBoard()` 及 `setClipBoard(text)`。每個方法都會回傳 Promise。
+
+### 權限
+
+為了資訊安全，我們採取較嚴格的權限授予設定。當使用者修改過 HTML 或其相關檔案，必需在設定界面重新受權。如果在開發階段必須反覆修改 HTML 及其相關檔案，可以使用「信任此資料夾」授權方式。
+
+![權限設定畫面](screenshot/permission.png)
+
+預設情況下，HTML 可執行 JavaScript，並存取由專案資料夾提供的檔案；但會**禁止**透過 `file://` 存取本機實體檔案、連線至外部網路、導覽至外部頁面、開啟彈出視窗、下載檔案、要求瀏覽器權限，以及與 Notepad++ 通訊。
+
+使用者可以在「選單設定」界面明確授予可信任的 HTML 資料夾進階權限，以放寬上述限制。授權後可連線或導覽至外部頁面、開啟彈出視窗及下載檔案、提出 WebView2 權限要求，並使用 `npp` API。`file://` 本機檔案也可能可以存取，實際情況仍受 WebView2 限制。請勿授權不可信任的 HTML 內容。
+
+您的 HTML 專案如需記錄狀態，可使用瀏覽器的 `localStorage` 儲存少量資料，例如偏好設定。NppMenuScripts 的 HTML 項目共用同一個 WebView2 網址來源，因此也會共用同一份 `localStorage`。
 
 ## 多國語言
 

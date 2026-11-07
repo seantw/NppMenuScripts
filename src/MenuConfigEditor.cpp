@@ -18,10 +18,12 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 #include "MenuConfigEditorResource.h"
 #include "Notepad_plus_msgs.h"
+#include "HtmlSecurity.h"
 
 extern "C" {
 #include "../third_party/cJSON.h"
@@ -32,7 +34,7 @@ namespace {
 static constexpr INT_PTR CONFIG_EDITOR_WORKSPACE_CHANGED_RESULT = 0x4D4B;
 static constexpr UINT TITLE_REFRESH_MESSAGE = WM_APP + 0x4D4;
 static constexpr UINT_PTR TITLE_REFRESH_TIMER = 0x4D55;
-enum class NodeKind { MenuRoot, ToolbarRoot, TopMenu, Submenu, Script, Action, Execute, Separator };
+enum class NodeKind { MenuRoot, ToolbarRoot, TopMenu, Submenu, Script, Html, Action, Execute, Separator };
 
 enum class DropPosition { None, Before, Into, After };
 static constexpr UINT_PTR TREE_DRAG_EXPAND_TIMER = 0x4D53;
@@ -43,6 +45,7 @@ struct EditorNode {
     cJSON* parent = nullptr;
     bool topMenu = false;
     unsigned int depth = 0;
+    int commandIndex = -1;
     std::wstring environmentText;
     bool environmentTextLoaded = false;
 };
@@ -62,6 +65,7 @@ struct EditorState {
     HWND tab = nullptr;
     HWND emptyForm = nullptr;
     HWND scriptForm = nullptr;
+    HWND htmlForm = nullptr;
     HWND actionForm = nullptr;
     HWND executeForm = nullptr;
     HWND submenuForm = nullptr;
@@ -104,9 +108,15 @@ struct EditorState {
     HWND envRemove = nullptr;
     HWND info = nullptr;
     HWND scriptHelpText = nullptr;
+    HWND htmlHelpText = nullptr;
+    HWND htmlAdvancedEnable = nullptr;
+    HWND htmlAuthModeGroup = nullptr;
+    HWND htmlAuthReconfirm = nullptr;
+    HWND htmlAuthTrustFolder = nullptr;
     HWND actionHelpText = nullptr;
     HWND submenuHelpText = nullptr;
     HWND newButton = nullptr;
+    HWND runButton = nullptr;
     HWND deleteButton = nullptr;
     HWND upButton = nullptr;
     HWND downButton = nullptr;
@@ -147,6 +157,12 @@ struct EditorState {
     std::vector<std::unique_ptr<EditorNode>> nodes;
     std::map<std::wstring, std::wstring> environment;
     std::vector<RichHelpLink> richHelpLinks;
+    std::set<std::wstring> persistedExpandedTreePaths;
+    bool hasPersistedTreeState = false;
+    bool htmlAuthorizationConfirmed = false;
+    std::wstring htmlAuthorizedFolder;
+    std::wstring htmlAuthorizedSha256;
+    std::wstring validationError;
     std::wstring currentIconPath;
     std::wstring shortcutHintText;
     std::wstring workspaceFolder;
@@ -289,7 +305,12 @@ static bool pathWithin(const std::wstring& directory, const std::wstring& path)
 
 static std::wstring storedPath(const std::wstring& base, const std::wstring& path)
 {
-    const std::wstring absolute = fullPath(path);
+    if (path.empty()) return {};
+    // Paths shown in the editor may already be relative to the workspace.
+    // Resolve them against that base before converting back to the stored form;
+    // GetFullPathName(path) alone would incorrectly use Notepad++'s CWD and can
+    // cause a path such as ./script/page/index.html to be prefixed twice.
+    const std::wstring absolute = isAbsolute(path) ? fullPath(path) : joinPath(base, path);
     const std::wstring baseFull = fullPath(base);
     if (!baseFull.empty() && CompareStringOrdinal(baseFull.c_str(), static_cast<int>(baseFull.size()),
                                                    absolute.c_str(), static_cast<int>(absolute.size()), TRUE) == CSTR_EQUAL)
@@ -368,6 +389,13 @@ static bool fileExists(const std::wstring& path)
 {
     const DWORD attrs = GetFileAttributesW(path.c_str());
     return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool htmlFolderHasIndex(const std::wstring& folder)
+{
+    const DWORD folderAttributes = GetFileAttributesW(folder.c_str());
+    if (folderAttributes == INVALID_FILE_ATTRIBUTES || !(folderAttributes & FILE_ATTRIBUTE_DIRECTORY)) return false;
+    return fileExists(joinPath(folder, L"index.html"));
 }
 
 static cJSON* member(cJSON* object, const char* key)
@@ -729,6 +757,7 @@ static HTREEITEM insertTreeNode(EditorState& s, HTREEITEM parent, const std::wst
         case NodeKind::TopMenu:
         case NodeKind::Submenu: image = 0; break;
         case NodeKind::Script: image = 1; break;
+        case NodeKind::Html: image = 8; break;
         case NodeKind::Action: image = 2; break;
         case NodeKind::Execute: image = 3; break;
         case NodeKind::Separator: image = 4; break;
@@ -746,13 +775,14 @@ static HTREEITEM insertTreeNode(EditorState& s, HTREEITEM parent, const std::wst
 static void initializeTreeImages(EditorState& s)
 {
     const int size = std::max(16, GetSystemMetrics(SM_CXSMICON));
-    HIMAGELIST images = ImageList_Create(size, size, ILC_COLOR32 | ILC_MASK, 7, 0);
+    HIMAGELIST images = ImageList_Create(size, size, ILC_COLOR32 | ILC_MASK, 9, 0);
     if (!images) return;
     const int resources[] = {
         IDR_TREE_FOLDER_ICON, IDR_TREE_SCRIPT_ICON,
         IDR_TREE_ACTION_ICON, IDR_TREE_COMMAND_ICON,
         IDR_TREE_SEPARATOR_ICON,
-        IDR_TREE_MENU_ICON, IDR_TREE_TOOLBAR_ICON
+        IDR_TREE_MENU_ICON, IDR_TREE_TOOLBAR_ICON,
+        IDR_TREE_FOLDER_OPEN_ICON, IDR_TREE_HTML_ICON
     };
     bool complete = true;
     for (int resource : resources) {
@@ -826,7 +856,22 @@ static void refreshSelectedTreeItemTitle(EditorState& s)
     SendMessageW(s.tree, TVM_SETITEMW, 0, reinterpret_cast<LPARAM>(&update));
 }
 
-static void addTreeArray(EditorState& s, HTREEITEM parentItem, cJSON* array, unsigned int depth)
+static bool isRunnableNode(NodeKind kind)
+{
+    return kind == NodeKind::Script || kind == NodeKind::Html ||
+           kind == NodeKind::Action || kind == NodeKind::Execute;
+}
+
+static void updateRunButton(EditorState& s)
+{
+    if (!s.runButton) return;
+    const bool enabled = !s.dirty && s.selected && isRunnableNode(s.selected->kind) &&
+                         s.selected->commandIndex >= 0 && static_cast<bool>(s.context.runSelectedItem);
+    EnableWindow(s.runButton, enabled);
+}
+
+static void addTreeArray(EditorState& s, HTREEITEM parentItem, cJSON* array,
+                         unsigned int depth, int& commandIndex)
 {
     for (cJSON* item = array ? array->child : nullptr; item; item = item->next) {
         EditorNode* node = nullptr;
@@ -839,6 +884,8 @@ static void addTreeArray(EditorState& s, HTREEITEM parentItem, cJSON* array, uns
             node = makeNode(s, NodeKind::Separator, item, array, false, depth);
         } else if (member(item, "script")) {
             node = makeNode(s, NodeKind::Script, item, array, false, depth);
+        } else if (member(item, "html")) {
+            node = makeNode(s, NodeKind::Html, item, array, false, depth);
         } else if (member(item, "action")) {
             node = makeNode(s, NodeKind::Action, item, array, false, depth);
         } else if (member(item, "execute")) {
@@ -846,9 +893,11 @@ static void addTreeArray(EditorState& s, HTREEITEM parentItem, cJSON* array, uns
         } else {
             continue;
         }
+        if (isRunnableNode(node->kind)) node->commandIndex = commandIndex++;
         HTREEITEM child = insertTreeNode(s, parentItem, itemTitle(node), node);
-        if (node->kind == NodeKind::TopMenu) addTreeArray(s, child, node->value, depth + 1);
-        else if (node->kind == NodeKind::Submenu) addTreeArray(s, child, member(node->value, "sub"), depth + 1);
+        if (node->kind == NodeKind::TopMenu) addTreeArray(s, child, node->value, depth + 1, commandIndex);
+        else if (node->kind == NodeKind::Submenu)
+            addTreeArray(s, child, member(node->value, "sub"), depth + 1, commandIndex);
     }
 }
 
@@ -868,15 +917,34 @@ static void captureTreeExpansion(EditorState& s, HTREEITEM item, std::map<cJSON*
     }
 }
 
-static void restoreTreeExpansion(EditorState& s, HTREEITEM item,
-                                 const std::map<cJSON*, bool>& expansion, bool initialBuild)
+static std::wstring treeItemPath(EditorState& s, HTREEITEM item, const std::wstring& parentPath,
+                                 int siblingIndex, bool rootLevel)
 {
+    TVITEMW data{};
+    data.mask = TVIF_PARAM;
+    data.hItem = item;
+    EditorNode* node = TreeView_GetItem(s.tree, &data)
+        ? reinterpret_cast<EditorNode*>(data.lParam) : nullptr;
+    if (rootLevel) {
+        if (node && node->kind == NodeKind::MenuRoot) return L"M";
+        if (node && node->kind == NodeKind::ToolbarRoot) return L"T";
+        return L"?";
+    }
+    return parentPath + L"/" + std::to_wstring(siblingIndex);
+}
+
+static void restoreTreeExpansion(EditorState& s, HTREEITEM item,
+                                 const std::map<cJSON*, bool>& expansion, bool initialBuild,
+                                 const std::wstring& parentPath = L"")
+{
+    int siblingIndex = 0;
     for (HTREEITEM current = item; current; current = TreeView_GetNextSibling(s.tree, current)) {
         TVITEMW data{};
         data.mask = TVIF_PARAM;
         data.hItem = current;
         EditorNode* node = TreeView_GetItem(s.tree, &data)
             ? reinterpret_cast<EditorNode*>(data.lParam) : nullptr;
+        const std::wstring path = treeItemPath(s, current, parentPath, siblingIndex++, parentPath.empty());
         bool expanded = false;
         bool hasSavedState = false;
         if (node && node->value) {
@@ -886,12 +954,72 @@ static void restoreTreeExpansion(EditorState& s, HTREEITEM item,
                 hasSavedState = true;
             }
         }
+        if (!hasSavedState && initialBuild && s.hasPersistedTreeState) {
+            expanded = s.persistedExpandedTreePaths.find(path) != s.persistedExpandedTreePaths.end();
+            hasSavedState = true;
+        }
         if (hasSavedState)
             TreeView_Expand(s.tree, current, expanded ? TVE_EXPAND : TVE_COLLAPSE);
         else if (initialBuild && node &&
                  (node->kind == NodeKind::MenuRoot || node->kind == NodeKind::ToolbarRoot))
             TreeView_Expand(s.tree, current, TVE_EXPAND);
-        restoreTreeExpansion(s, TreeView_GetChild(s.tree, current), expansion, initialBuild);
+        restoreTreeExpansion(s, TreeView_GetChild(s.tree, current), expansion, initialBuild, path);
+    }
+}
+
+static void collectExpandedTreePaths(EditorState& s, HTREEITEM item, const std::wstring& parentPath,
+                                     bool rootLevel, std::set<std::wstring>& expandedPaths)
+{
+    int siblingIndex = 0;
+    for (HTREEITEM current = item; current; current = TreeView_GetNextSibling(s.tree, current)) {
+        const std::wstring path = treeItemPath(s, current, parentPath, siblingIndex++, rootLevel);
+        TVITEMW data{};
+        data.mask = TVIF_STATE;
+        data.stateMask = TVIS_EXPANDED;
+        data.hItem = current;
+        if (TreeView_GetItem(s.tree, &data) && (data.state & TVIS_EXPANDED) &&
+            TreeView_GetChild(s.tree, current))
+            expandedPaths.insert(path);
+        collectExpandedTreePaths(s, TreeView_GetChild(s.tree, current), path, false, expandedPaths);
+    }
+}
+
+static void savePersistentTreeExpansion(EditorState& s)
+{
+    if (s.context.settingsFilePath.empty() || !s.tree || !IsWindow(s.tree)) return;
+    std::set<std::wstring> expandedPaths;
+    collectExpandedTreePaths(s, TreeView_GetChild(s.tree, TVI_ROOT), L"", true, expandedPaths);
+    std::wstring serialized;
+    for (const auto& path : expandedPaths) {
+        if (!serialized.empty()) serialized.push_back(L'|');
+        serialized += path;
+    }
+    const size_t slash = s.context.settingsFilePath.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        const std::wstring directory = s.context.settingsFilePath.substr(0, slash);
+        SHCreateDirectoryExW(nullptr, directory.c_str(), nullptr);
+    }
+    WritePrivateProfileStringW(L"TreeState", L"expanded", serialized.c_str(),
+                               s.context.settingsFilePath.c_str());
+}
+
+static void loadPersistentTreeExpansion(EditorState& s)
+{
+    if (s.context.settingsFilePath.empty()) return;
+    constexpr wchar_t missing[] = L"__NMS_TREE_STATE_MISSING__";
+    wchar_t value[32768] = {};
+    GetPrivateProfileStringW(L"TreeState", L"expanded", missing, value,
+                             static_cast<DWORD>(std::size(value)), s.context.settingsFilePath.c_str());
+    if (std::wstring(value) == missing) return;
+    s.hasPersistedTreeState = true;
+    const std::wstring serialized(value);
+    size_t start = 0;
+    while (start < serialized.size()) {
+        const size_t end = serialized.find(L'|', start);
+        const std::wstring path = serialized.substr(start, end == std::wstring::npos ? end : end - start);
+        if (!path.empty()) s.persistedExpandedTreePaths.insert(path);
+        if (end == std::wstring::npos) break;
+        start = end + 1;
     }
 }
 
@@ -911,9 +1039,10 @@ static void rebuildTree(EditorState& s, cJSON* selectedValue = nullptr)
     EditorNode* menuRoot = makeNode(s, NodeKind::MenuRoot, s.menu, s.root, false, 0);
     EditorNode* toolbarRoot = makeNode(s, NodeKind::ToolbarRoot, s.toolbar, s.root, false, 0);
     HTREEITEM menuItem = insertTreeNode(s, TVI_ROOT, tr(s, "ConfigMenuRoot"), menuRoot);
-    addTreeArray(s, menuItem, s.menu, 1);
+    int commandIndex = 0;
+    addTreeArray(s, menuItem, s.menu, 1, commandIndex);
     HTREEITEM toolbarItem = insertTreeNode(s, TVI_ROOT, tr(s, "ConfigToolbarRoot"), toolbarRoot);
-    addTreeArray(s, toolbarItem, s.toolbar, 1);
+    addTreeArray(s, toolbarItem, s.toolbar, 1, commandIndex);
     restoreTreeExpansion(s, TreeView_GetChild(s.tree, TVI_ROOT), expansion, initialBuild);
     HTREEITEM selectedItem = nullptr;
     const int count = TreeView_GetCount(s.tree);
@@ -1185,6 +1314,7 @@ static void endTreeDrag(EditorState& s, bool applyDrop)
     SetCursor(systemCursor(32512)); // IDC_ARROW
     if (applyDrop && source && target && position != DropPosition::None)
         performTreeDrop(s, source, target, position);
+    updateRunButton(s);
 }
 
 static void beginTreeDrag(EditorState& s, HTREEITEM item)
@@ -1331,6 +1461,7 @@ static HWND itemFormFor(EditorState& s, EditorNode* node)
     case NodeKind::TopMenu:
     case NodeKind::Submenu: return s.submenuForm;
     case NodeKind::Script: return s.scriptForm;
+    case NodeKind::Html: return s.htmlForm;
     case NodeKind::Action: return s.actionForm;
     case NodeKind::Execute: return s.executeForm;
     case NodeKind::Separator: return s.separatorForm;
@@ -1342,7 +1473,7 @@ static void bindItemForm(EditorState& s, EditorNode* node)
 {
     HWND form = itemFormFor(s, node);
     if (s.activeItemForm) ShowWindow(s.activeItemForm, SW_HIDE);
-    for (HWND other : {s.emptyForm, s.scriptForm, s.actionForm, s.executeForm,
+    for (HWND other : {s.emptyForm, s.scriptForm, s.htmlForm, s.actionForm, s.executeForm,
                        s.submenuForm, s.separatorForm})
         if (other && other != form) ShowWindow(other, SW_HIDE);
     s.activeItemForm = form;
@@ -1365,6 +1496,8 @@ static void bindItemForm(EditorState& s, EditorNode* node)
     s.codePageHelp = get(ID_CODE_PAGE_HELP);
     s.envLabel = get(ID_ENV_LABEL); s.envList = get(ID_ENV_LIST); s.envHelp = get(ID_ENV_HELP);
     s.info = get(ID_INFO);
+    if (s.scriptLabel) SetWindowTextW(s.scriptLabel,
+        tr(s, node && node->kind == NodeKind::Html ? "ConfigHtmlFolder" : "ConfigScriptFile").c_str());
 
     if (s.shortcut) {
         SetWindowSubclass(s.shortcut, shortcutSubclass, 1, reinterpret_cast<DWORD_PTR>(&s));
@@ -1382,14 +1515,14 @@ static void bindItemForm(EditorState& s, EditorNode* node)
 static void showTypeControls(EditorState& s, NodeKind kind, bool hasItem)
 {
     const bool submenu = kind == NodeKind::Submenu || kind == NodeKind::TopMenu;
-    const bool script = kind == NodeKind::Script;
+    const bool script = kind == NodeKind::Script || kind == NodeKind::Html;
     const bool action = kind == NodeKind::Action;
     const bool execute = kind == NodeKind::Execute;
     const bool separator = kind == NodeKind::Separator;
     show(s.icon, hasItem && s.toolbarItem && s.icon);
     if (s.header) {
         std::wstring heading;
-        if (script) heading = tr(s, "ConfigScriptSettings");
+        if (script) heading = tr(s, kind == NodeKind::Html ? "ConfigHtmlSettings" : "ConfigScriptSettings");
         else if (action) heading = tr(s, "ConfigActionSettings");
         else if (execute) heading = tr(s, "ConfigExecuteSettings");
         else if (submenu) heading = tr(s, "ConfigSubmenuSettings");
@@ -1418,6 +1551,133 @@ static void showActionTargetControls(EditorState& s, bool visible, bool repaintP
     }
 }
 
+static void updateHtmlAuthorizationOptions(EditorState& s, bool enabled)
+{
+    if (!enabled && s.htmlForm) {
+        // Returning to the unchecked state must always reset the display-only
+        // authorization choice to the first option.
+        CheckRadioButton(s.htmlForm, ID_HTML_AUTH_RECONFIRM,
+                         ID_HTML_AUTH_TRUST_FOLDER, ID_HTML_AUTH_RECONFIRM);
+    }
+
+    EnableWindow(s.htmlAuthReconfirm, enabled);
+    EnableWindow(s.htmlAuthTrustFolder, enabled);
+}
+
+static HtmlPermissionGrant htmlPermissionGrant(cJSON* item)
+{
+    HtmlPermissionGrant grant;
+    cJSON* object = member(item, "html_permissions");
+    cJSON* mode = member(object, "mode");
+    cJSON* folder = member(object, "folder");
+    cJSON* digest = member(object, "sha256");
+    if (!cJSON_IsObject(object) || !cJSON_IsString(mode) || !mode->valuestring ||
+        !cJSON_IsString(folder) || !folder->valuestring) return grant;
+    grant.mode = fromUtf8(mode->valuestring);
+    grant.folder = fromUtf8(folder->valuestring);
+    if (cJSON_IsString(digest) && digest->valuestring) grant.sha256 = fromUtf8(digest->valuestring);
+    if (grant.mode != L"reconfirm" && grant.mode != L"trust_folder") return {};
+    if ((grant.mode == L"reconfirm" && grant.sha256.size() != 64) ||
+        (grant.mode == L"trust_folder" && !grant.sha256.empty())) return {};
+    return grant;
+}
+
+static void invalidateHtmlAuthorizationIfFolderChanged(EditorState& s)
+{
+    if (s.updating || !s.selected || s.selected->kind != NodeKind::Html || !s.htmlAdvancedEnable ||
+        IsDlgButtonChecked(s.htmlForm, ID_HTML_ADVANCED_ENABLE) != BST_CHECKED) return;
+    const std::wstring folder = canonicalHtmlFolderPath(
+        resolvedPath(s.workspaceFolder, readText(s.script)));
+    if (!folder.empty() && !s.htmlAuthorizedFolder.empty() &&
+        CompareStringOrdinal(folder.c_str(), -1, s.htmlAuthorizedFolder.c_str(), -1, TRUE) == CSTR_EQUAL)
+        return;
+    CheckDlgButton(s.htmlForm, ID_HTML_ADVANCED_ENABLE, BST_UNCHECKED);
+    s.htmlAuthorizationConfirmed = false;
+    s.htmlAuthorizedFolder.clear();
+    s.htmlAuthorizedSha256.clear();
+    updateHtmlAuthorizationOptions(s, false);
+    s.dirty = true;
+}
+
+static INT_PTR CALLBACK htmlPermissionPreviewProc(HWND dialog, UINT message,
+                                                 WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_DESTROY) {
+        HFONT emphasisFont = reinterpret_cast<HFONT>(RemovePropW(dialog, L"NppMenuScriptsHtmlPermissionEmphasisFont"));
+        if (emphasisFont) DeleteObject(emphasisFont);
+        return FALSE;
+    }
+
+    auto* s = reinterpret_cast<EditorState*>(GetWindowLongPtrW(dialog, DWLP_USER));
+    if (message == WM_INITDIALOG) {
+        s = reinterpret_cast<EditorState*>(lParam);
+        SetWindowLongPtrW(dialog, DWLP_USER, reinterpret_cast<LONG_PTR>(s));
+        if (s) {
+            SetWindowTextW(dialog, tr(*s, "HtmlPermDialogTitle").c_str());
+            SetDlgItemTextW(dialog, ID_HTML_PERMISSION_HEADING, tr(*s, "HtmlPermHeading").c_str());
+            SetDlgItemTextW(dialog, ID_HTML_PERMISSION_RISK, tr(*s, "HtmlPermRisk").c_str());
+            SetDlgItemTextW(dialog, ID_HTML_PERMISSION_PROMPT, tr(*s, "HtmlPermTypePrompt").c_str());
+            SetDlgItemTextW(dialog, ID_HTML_PERMISSION_PHRASE, tr(*s, "HtmlPermPhrase").c_str());
+            SetDlgItemTextW(dialog, IDOK, tr(*s, "HtmlPermEnable").c_str());
+            SetDlgItemTextW(dialog, IDCANCEL, tr(*s, "ConfigCancel").c_str());
+            EnableWindow(GetDlgItem(dialog, IDOK), FALSE);
+            SendDlgItemMessageW(dialog, ID_HTML_PERMISSION_ICON, STM_SETICON,
+                                reinterpret_cast<WPARAM>(LoadImageW(s->context.module,
+                                    MAKEINTRESOURCEW(IDR_HTML_PERMISSION_ICON), IMAGE_ICON,
+                                    32, 40, LR_DEFAULTCOLOR | LR_SHARED)), 0);
+
+            RECT ownerRect{}, dialogRect{};
+            if (s->hwnd && GetWindowRect(s->hwnd, &ownerRect) && GetWindowRect(dialog, &dialogRect)) {
+                const int x = ownerRect.left + ((ownerRect.right - ownerRect.left) -
+                                                (dialogRect.right - dialogRect.left)) / 2;
+                const int y = ownerRect.top + ((ownerRect.bottom - ownerRect.top) -
+                                               (dialogRect.bottom - dialogRect.top)) / 2;
+                SetWindowPos(dialog, nullptr, x, y, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+
+            LOGFONTW fontInfo{};
+            HFONT dialogFont = reinterpret_cast<HFONT>(SendMessageW(dialog, WM_GETFONT, 0, 0));
+            if (dialogFont && GetObjectW(dialogFont, sizeof(fontInfo), &fontInfo) == sizeof(fontInfo)) {
+                fontInfo.lfWeight = FW_BOLD;
+                HFONT emphasisFont = CreateFontIndirectW(&fontInfo);
+                if (emphasisFont) {
+                    SetPropW(dialog, L"NppMenuScriptsHtmlPermissionEmphasisFont", emphasisFont);
+                    SendDlgItemMessageW(dialog, ID_HTML_PERMISSION_HEADING, WM_SETFONT,
+                                        reinterpret_cast<WPARAM>(emphasisFont), TRUE);
+                    SendDlgItemMessageW(dialog, ID_HTML_PERMISSION_PHRASE, WM_SETFONT,
+                                        reinterpret_cast<WPARAM>(emphasisFont), TRUE);
+                }
+            }
+        }
+        return TRUE;
+    }
+    if (message == WM_COMMAND) {
+        const int id = LOWORD(wParam);
+        if (id == ID_HTML_PERMISSION_INPUT && HIWORD(wParam) == EN_CHANGE && s) {
+            EnableWindow(GetDlgItem(dialog, IDOK),
+                         readText(GetDlgItem(dialog, ID_HTML_PERMISSION_INPUT)) ==
+                             tr(*s, "HtmlPermPhrase"));
+            return TRUE;
+        }
+        if (id == IDOK || id == IDCANCEL) {
+            if (id == IDOK && s &&
+                readText(GetDlgItem(dialog, ID_HTML_PERMISSION_INPUT)) != tr(*s, "HtmlPermPhrase"))
+                return TRUE;
+            EndDialog(dialog, id);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static INT_PTR showHtmlPermissionPreview(EditorState& s)
+{
+    return DialogBoxParamW(s.context.module, MAKEINTRESOURCEW(IDD_HTML_PERMISSION_PREVIEW),
+                           s.hwnd, htmlPermissionPreviewProc,
+                           reinterpret_cast<LPARAM>(&s));
+}
+
 static void loadSelected(EditorState& s, EditorNode* node)
 {
     s.updating = true;
@@ -1428,6 +1688,21 @@ static void loadSelected(EditorState& s, EditorNode* node)
     const bool separator = node && node->kind == NodeKind::Separator;
     const bool hasItem = node && node->kind != NodeKind::MenuRoot && node->kind != NodeKind::ToolbarRoot;
     showTypeControls(s, node ? node->kind : NodeKind::MenuRoot, hasItem);
+    if (node && (node->kind == NodeKind::Script || node->kind == NodeKind::Html)) {
+        if (node->kind == NodeKind::Html) {
+            setRichHelpContent(s, s.htmlHelpText,
+                {{tr(s, "ConfigHtmlHelp"), L""},
+                 {tr(s, "ConfigHtmlPermissionsHelp"), s.context.htmlPermissionsUrl}}, 100);
+            s.htmlAuthorizationConfirmed = false;
+            s.htmlAuthorizedFolder.clear();
+            s.htmlAuthorizedSha256.clear();
+        } else {
+            setRichHelpContent(s, s.scriptHelpText,
+                {{tr(s, "ConfigScriptHelpRuntime"), s.context.scriptRequirementsUrl},
+                 {tr(s, "ConfigScriptHelpCreate"), s.context.scriptTemplateUrl},
+                 {tr(s, "ConfigScriptHelpApi"), s.context.scriptApiUrl}}, 100);
+        }
+    }
     std::wstring title;
     if (node && node->topMenu) title = fromUtf8(node->value->string);
     else if (node && hasItem && node->kind != NodeKind::Separator) {
@@ -1441,6 +1716,22 @@ static void loadSelected(EditorState& s, EditorNode* node)
     if (node && node->kind == NodeKind::Script) {
         cJSON* value = member(node->value, "script");
         SetWindowTextW(s.script, cJSON_IsString(value) ? fromUtf8(value->valuestring).c_str() : L"");
+    }
+    if (node && node->kind == NodeKind::Html) {
+        cJSON* value = member(node->value, "html");
+        SetWindowTextW(s.script, cJSON_IsString(value) ? fromUtf8(value->valuestring).c_str() : L"");
+        const HtmlPermissionGrant grant = htmlPermissionGrant(node->value);
+        const std::wstring htmlFolder = canonicalHtmlFolderPath(
+            resolvedPath(s.workspaceFolder, cJSON_IsString(value) ? fromUtf8(value->valuestring) : L""));
+        const bool grantValid = grant.enabled() && validateHtmlPermissionGrant(htmlFolder, grant);
+        s.htmlAuthorizationConfirmed = grantValid;
+        s.htmlAuthorizedFolder = grantValid ? htmlFolder : L"";
+        s.htmlAuthorizedSha256 = grantValid && grant.mode == L"reconfirm" ? grant.sha256 : L"";
+        CheckDlgButton(s.htmlForm, ID_HTML_ADVANCED_ENABLE,
+                       grantValid ? BST_CHECKED : BST_UNCHECKED);
+        CheckRadioButton(s.htmlForm, ID_HTML_AUTH_RECONFIRM, ID_HTML_AUTH_TRUST_FOLDER,
+                         grant.mode == L"trust_folder" ? ID_HTML_AUTH_TRUST_FOLDER : ID_HTML_AUTH_RECONFIRM);
+        updateHtmlAuthorizationOptions(s, grantValid);
     }
     if (node && node->kind == NodeKind::Action) {
         cJSON* value = member(node->value, "action");
@@ -1488,6 +1779,7 @@ static void loadSelected(EditorState& s, EditorNode* node)
     }
     EnableWindow(s.upButton, hasPrevious);
     EnableWindow(s.downButton, hasNext);
+    updateRunButton(s);
     if (!hasItem) setRichPlainText(s, s.info, tr(s, node && node->kind == NodeKind::ToolbarRoot ? "ConfigSelectToolbar" : "ConfigSelectMenu"));
     else if (separator) setRichPlainText(s, s.info, tr(s, "ConfigSeparatorInfo"));
     s.updating = false;
@@ -1521,6 +1813,40 @@ static bool commitSelected(EditorState& s)
     if (!setObjectString(node->value, "title", title)) return false;
     if (node->kind == NodeKind::Script) {
         if (!setObjectString(node->value, "script", storedScriptPath(s.scriptFolder, readText(s.script)))) return false;
+    } else if (node->kind == NodeKind::Html) {
+        const std::wstring folder = resolvedPath(s.workspaceFolder, readText(s.script));
+        if (!setObjectString(node->value, "html", storedPath(s.workspaceFolder, folder))) return false;
+        const bool authorized = IsDlgButtonChecked(s.htmlForm, ID_HTML_ADVANCED_ENABLE) == BST_CHECKED;
+        if (!authorized) {
+            cJSON_DeleteItemFromObjectCaseSensitive(node->value, "html_permissions");
+            s.htmlAuthorizationConfirmed = false;
+            s.htmlAuthorizedFolder.clear();
+            s.htmlAuthorizedSha256.clear();
+        } else {
+            const std::wstring canonicalFolder = canonicalHtmlFolderPath(folder);
+            if (!s.htmlAuthorizationConfirmed || canonicalFolder.empty() ||
+                s.htmlAuthorizedFolder.empty() ||
+                CompareStringOrdinal(canonicalFolder.c_str(), -1, s.htmlAuthorizedFolder.c_str(), -1, TRUE) != CSTR_EQUAL ||
+                !htmlFolderHasIndex(canonicalFolder)) {
+                s.validationError = tr(s, "ConfigHtmlIndexMissing");
+                return false;
+            }
+            const bool trustFolder = IsDlgButtonChecked(s.htmlForm, ID_HTML_AUTH_TRUST_FOLDER) == BST_CHECKED;
+            HtmlPermissionGrant grant;
+            grant.mode = trustFolder ? L"trust_folder" : L"reconfirm";
+            grant.folder = canonicalFolder;
+            if (!trustFolder && (s.htmlAuthorizedSha256.empty() ||
+                !htmlFolderSha256(canonicalFolder, grant.sha256) ||
+                CompareStringOrdinal(grant.sha256.c_str(), -1, s.htmlAuthorizedSha256.c_str(), -1, TRUE) != CSTR_EQUAL)) {
+                s.validationError = tr(s, "ConfigHtmlIndexMissing");
+                return false;
+            }
+            cJSON_DeleteItemFromObjectCaseSensitive(node->value, "html_permissions");
+            cJSON* permissions = cJSON_AddObjectToObject(node->value, "html_permissions");
+            if (!permissions || !setObjectString(permissions, "mode", grant.mode) ||
+                !setObjectString(permissions, "folder", grant.folder) ||
+                (!trustFolder && !setObjectString(permissions, "sha256", grant.sha256))) return false;
+        }
     } else if (node->kind == NodeKind::Action) {
         const LRESULT index = SendMessageW(s.action, CB_GETCURSEL, 0, 0);
         const int actionKind = index == CB_ERR ? 1 : static_cast<int>(SendMessageW(s.action, CB_GETITEMDATA, index, 0));
@@ -1578,17 +1904,18 @@ static bool validateItems(EditorState& s, cJSON* items, unsigned int depth,
         if (!item->child) continue;
         cJSON* title = member(item, "title");
         cJSON* script = member(item, "script");
+        cJSON* html = member(item, "html");
         cJSON* action = member(item, "action");
         cJSON* execute = member(item, "execute");
         cJSON* sub = member(item, "sub");
         if (sub) {
-            if (!cJSON_IsString(title) || !title->valuestring || !title->valuestring[0] || !cJSON_IsArray(sub) || script || action || execute || depth == 16) {
+            if (!cJSON_IsString(title) || !title->valuestring || !title->valuestring[0] || !cJSON_IsArray(sub) || script || html || action || execute || depth == 16) {
                 error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
                 return false;
             }
             if (!validateItems(s, sub, depth + 1, itemPath, error)) return false;
         } else {
-            if (!cJSON_IsString(title) || !title->valuestring || !title->valuestring[0] || static_cast<int>(!!script) + static_cast<int>(!!action) + static_cast<int>(!!execute) != 1) {
+            if (!cJSON_IsString(title) || !title->valuestring || !title->valuestring[0] || static_cast<int>(!!script) + static_cast<int>(!!html) + static_cast<int>(!!action) + static_cast<int>(!!execute) != 1) {
                 error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
                 return false;
             }
@@ -1606,6 +1933,16 @@ static bool validateItems(EditorState& s, cJSON* items, unsigned int depth,
                 const std::wstring ext = path.substr(dot);
                 if (_wcsicmp(ext.c_str(), L".js") && _wcsicmp(ext.c_str(), L".mjs") && _wcsicmp(ext.c_str(), L".pl") && _wcsicmp(ext.c_str(), L".py")) {
                     error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
+                    return false;
+                }
+            } else if (html) {
+                if (!cJSON_IsString(html) || !html->valuestring || !*html->valuestring) {
+                    error = tr(s, "ConfigInvalidJson") + L"\n\n" + itemPath;
+                    return false;
+                }
+                const std::wstring folder = resolvedPath(s.workspaceFolder, fromUtf8(html->valuestring));
+                if (!htmlFolderHasIndex(folder)) {
+                    error = tr(s, "ConfigHtmlIndexMissing") + L"\n\n" + itemPath;
                     return false;
                 }
             } else if (action) {
@@ -1653,7 +1990,8 @@ static bool validateItems(EditorState& s, cJSON* items, unsigned int depth,
 
 static bool validateAndCommit(EditorState& s, std::wstring& error)
 {
-    if (!commitSelected(s)) { error = tr(s, "ConfigDuplicateMenuTitle"); return false; }
+    s.validationError.clear();
+    if (!commitSelected(s)) { error = s.validationError.empty() ? tr(s, "ConfigDuplicateMenuTitle") : s.validationError; return false; }
     if (!cJSON_IsObject(s.root) || !cJSON_IsObject(s.menu)) { error = tr(s, "ConfigInvalidJson"); return false; }
     for (cJSON* group = s.menu->child; group; group = group->next) {
         for (cJSON* other = group->next; other; other = other->next)
@@ -1670,8 +2008,12 @@ static bool validateAndCommit(EditorState& s, std::wstring& error)
     if (s.toolbar && cJSON_GetArraySize(s.toolbar) > 32) { error = tr(s, "ConfigInvalidJson"); return false; }
     for (cJSON* item = s.toolbar ? s.toolbar->child : nullptr; item; item = item->next) {
         if (!cJSON_IsObject(item) || !cJSON_IsString(member(item, "title"))) { error = tr(s, "ConfigInvalidJson"); return false; }
-        cJSON* script = member(item, "script"), *action = member(item, "action"), *execute = member(item, "execute");
-        if (static_cast<int>(!!script) + static_cast<int>(!!action) + static_cast<int>(!!execute) != 1) { error = tr(s, "ConfigInvalidJson"); return false; }
+        cJSON* script = member(item, "script"), *action = member(item, "action"), *execute = member(item, "execute"), *html = member(item, "html");
+        if (static_cast<int>(!!script) + static_cast<int>(!!action) + static_cast<int>(!!execute) + static_cast<int>(!!html) != 1) { error = tr(s, "ConfigInvalidJson"); return false; }
+        if (html && (!cJSON_IsString(html) || !html->valuestring || !html->valuestring[0])) { error = tr(s, "ConfigInvalidJson"); return false; }
+        if (html && !htmlFolderHasIndex(resolvedPath(s.workspaceFolder, fromUtf8(html->valuestring)))) {
+            error = tr(s, "ConfigHtmlIndexMissing"); return false;
+        }
         cJSON* icon = member(item, "icon");
         if (icon) {
             if (!cJSON_IsString(icon)) { error = tr(s, "ConfigInvalidJson"); return false; }
@@ -1768,12 +2110,30 @@ static void showSaveError(EditorState& s, const std::wstring& error)
     if (!error.empty()) MessageBoxW(s.hwnd, error.c_str(), tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONERROR);
 }
 
+static std::wstring browseFolder(EditorState& s, const std::wstring& initial, const char* titleKey);
+
 static void chooseScriptFile(EditorState& s)
 {
+    const bool html = s.selected && s.selected->kind == NodeKind::Html;
+    if (html) {
+        const std::wstring current = readText(s.script);
+        const std::wstring initial = current.empty() ? s.workspaceFolder : resolvedPath(s.workspaceFolder, current);
+        const std::wstring folder = browseFolder(s, initial, "ConfigHtmlFolderBrowse");
+        if (folder.empty()) return;
+        if (!htmlFolderHasIndex(folder)) {
+            MessageBoxW(s.hwnd, tr(s, "ConfigHtmlIndexMissing").c_str(),
+                        tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING);
+            return;
+        }
+        SetWindowTextW(s.script, storedPath(s.workspaceFolder, folder).c_str());
+        s.dirty = true;
+        return;
+    }
     wchar_t file[32768]{};
     OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = s.hwnd;
     ofn.lpstrFilter = L"Supported scripts (*.js;*.mjs;*.pl;*.py)\0*.js;*.mjs;*.pl;*.py\0All files (*.*)\0*.*\0\0";
-    ofn.lpstrFile = file; ofn.nMaxFile = static_cast<DWORD>(std::size(file)); ofn.lpstrInitialDir = s.scriptFolder.c_str();
+    ofn.lpstrFile = file; ofn.nMaxFile = static_cast<DWORD>(std::size(file));
+    ofn.lpstrInitialDir = s.scriptFolder.c_str();
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
     if (GetOpenFileNameW(&ofn)) {
         const std::wstring selected = storedScriptPath(s.scriptFolder, file);
@@ -1785,18 +2145,27 @@ static void chooseScriptFile(EditorState& s)
 static void editScriptFile(EditorState& s)
 {
     const std::wstring scriptPath = readText(s.script);
-    const std::wstring path = resolvedPath(s.scriptFolder, scriptPath);
+    const bool html = s.selected && s.selected->kind == NodeKind::Html;
+    std::wstring path = resolvedPath(html ? s.workspaceFolder : s.scriptFolder, scriptPath);
     if (scriptPath.empty()) {
-        MessageBoxW(s.hwnd, tr(s, "ConfigScriptFileMissing").c_str(),
+        MessageBoxW(s.hwnd, tr(s, html ? "ConfigHtmlIndexMissing" : "ConfigScriptFileMissing").c_str(),
                     tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING);
         return;
     }
-    if (s.context.openOrCreateScript) {
+    if (!html && s.context.openOrCreateScript) {
         s.context.openOrCreateScript(s.hwnd, path);
         return;
     }
+    if (html) {
+        if (!htmlFolderHasIndex(path)) {
+            MessageBoxW(s.hwnd, tr(s, "ConfigHtmlIndexMissing").c_str(),
+                        tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING);
+            return;
+        }
+        path = joinPath(path, L"index.html");
+    }
     if (!fileExists(path)) {
-        MessageBoxW(s.hwnd, tr(s, "ConfigScriptFileMissing").c_str(),
+        MessageBoxW(s.hwnd, tr(s, html ? "ConfigHtmlIndexMissing" : "ConfigScriptFileMissing").c_str(),
                     tr(s, "ConfigTitle").c_str(), MB_OK | MB_ICONWARNING);
         return;
     }
@@ -1876,7 +2245,8 @@ static bool addItem(EditorState& s, int choice)
         rebuildTree(s, items);
         return true;
     }
-    if (selected->kind == NodeKind::ToolbarRoot && choice != ID_NEW_SCRIPT && choice != ID_NEW_EXECUTE && choice != ID_NEW_ACTION) return false;
+    if (selected->kind == NodeKind::ToolbarRoot && choice != ID_NEW_SCRIPT && choice != ID_NEW_EXECUTE &&
+        choice != ID_NEW_ACTION && choice != ID_NEW_HTML) return false;
     if (selected->kind != NodeKind::ToolbarRoot && selected->kind != NodeKind::TopMenu && selected->kind != NodeKind::Submenu) return false;
     if (selected->kind != NodeKind::ToolbarRoot && choice == ID_NEW_SUBMENU && selected->depth >= 17) return false;
     cJSON* selectedArray = selected->kind == NodeKind::ToolbarRoot ? s.toolbar :
@@ -1901,6 +2271,7 @@ static bool addItem(EditorState& s, int choice)
         const std::string defaultTitle = toUtf8(tr(s, "ConfigNewItemDefault"));
         cJSON_AddStringToObject(newItem, "title", defaultTitle.empty() ? "New Item" : defaultTitle.c_str());
         if (choice == ID_NEW_SCRIPT) cJSON_AddStringToObject(newItem, "script", "");
+        else if (choice == ID_NEW_HTML) cJSON_AddStringToObject(newItem, "html", "");
         else if (choice == ID_NEW_ACTION) cJSON_AddStringToObject(newItem, "action", "RUN_CURRENT_FILE");
         else if (choice == ID_NEW_EXECUTE) {
             cJSON* execute = cJSON_AddObjectToObject(newItem, "execute");
@@ -1997,6 +2368,8 @@ static void showTreeContextMenu(EditorState& s, POINT screenPoint)
     const bool toolbarRoot = node->kind == NodeKind::ToolbarRoot;
     const bool hasItem = node->parent && !menuRoot && !toolbarRoot;
     const bool canCreate = IsWindowEnabled(s.newButton) != FALSE;
+    const bool canRun = !s.dirty && isRunnableNode(node->kind) && node->commandIndex >= 0 &&
+                        static_cast<bool>(s.context.runSelectedItem);
 
     HMENU contextMenu = CreatePopupMenu();
     HMENU newMenu = CreatePopupMenu();
@@ -2006,6 +2379,7 @@ static void showTreeContextMenu(EditorState& s, POINT screenPoint)
         return;
     }
     AppendMenuW(newMenu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_SCRIPT, tr(s, "ConfigScript").c_str());
+    AppendMenuW(newMenu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_HTML, tr(s, "ConfigHtml").c_str());
     AppendMenuW(newMenu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_EXECUTE, tr(s, "ConfigExecute").c_str());
     AppendMenuW(newMenu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_ACTION, tr(s, "ConfigAction").c_str());
     AppendMenuW(newMenu, MF_SEPARATOR, 0, nullptr);
@@ -2017,6 +2391,9 @@ static void showTreeContextMenu(EditorState& s, POINT screenPoint)
     AppendMenuW(contextMenu, MF_POPUP | (canCreate ? 0 : MF_GRAYED),
                 reinterpret_cast<UINT_PTR>(newMenu), tr(s, "ConfigNew").c_str());
     AppendMenuW(contextMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(contextMenu, MF_STRING | (canRun ? 0 : MF_GRAYED), ID_RUN,
+                tr(s, "ConfigRun").c_str());
+    AppendMenuW(contextMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(contextMenu, MF_STRING | (hasItem ? 0 : MF_GRAYED), ID_DELETE,
                 tr(s, "ConfigDelete").c_str());
 
@@ -2024,8 +2401,10 @@ static void showTreeContextMenu(EditorState& s, POINT screenPoint)
     const UINT command = TrackPopupMenu(contextMenu, TPM_RETURNCMD | TPM_NONOTIFY,
                                         screenPoint.x, screenPoint.y, 0, s.hwnd, nullptr);
     DestroyMenu(contextMenu);
-    if (command == ID_DELETE) deleteSelected(s);
-    else if (command >= ID_NEW_SCRIPT && command <= ID_NEW_SUBMENU)
+    if (command == ID_RUN && canRun)
+        s.context.runSelectedItem(static_cast<size_t>(node->commandIndex));
+    else if (command == ID_DELETE) deleteSelected(s);
+    else if (command >= ID_NEW_SCRIPT && command <= ID_NEW_HTML)
         addItem(s, static_cast<int>(command));
 }
 
@@ -2146,7 +2525,7 @@ static void showEditorPage(EditorState& s, int page)
     const bool pageChanged = page != s.activePage;
     SendMessageW(s.tab, TCM_SETCURSEL, page, 0);
     s.activePage = page;
-    for (HWND form : {s.emptyForm, s.scriptForm, s.actionForm, s.executeForm,
+    for (HWND form : {s.emptyForm, s.scriptForm, s.htmlForm, s.actionForm, s.executeForm,
                       s.submenuForm, s.separatorForm}) show(form, false);
     show(s.settingsForm, false);
     show(s.header, page == 0);
@@ -2159,11 +2538,12 @@ static void showEditorPage(EditorState& s, int page)
         }
     }
     if (page != 0) {
-        show(s.newButton, false); show(s.deleteButton, false);
+        show(s.newButton, false); show(s.runButton, false); show(s.deleteButton, false);
         show(s.upButton, false); show(s.downButton, false); show(s.tree, false);
     }
     if (page == 0) {
         show(s.newButton, true);
+        show(s.runButton, true);
         show(s.deleteButton, true);
         show(s.upButton, true);
         show(s.downButton, true);
@@ -2224,6 +2604,7 @@ static void onCommand(EditorState& s, int id, int notification)
         const bool menuRoot = s.selected && s.selected->kind == NodeKind::MenuRoot;
         const bool toolbarRoot = s.selected && s.selected->kind == NodeKind::ToolbarRoot;
         AppendMenuW(menu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_SCRIPT, tr(s, "ConfigScript").c_str());
+        AppendMenuW(menu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_HTML, tr(s, "ConfigHtml").c_str());
         AppendMenuW(menu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_EXECUTE, tr(s, "ConfigExecute").c_str());
         AppendMenuW(menu, MF_STRING | (menuRoot ? MF_GRAYED : 0), ID_NEW_ACTION, tr(s, "ConfigAction").c_str());
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -2237,6 +2618,11 @@ static void onCommand(EditorState& s, int id, int notification)
     } else if (id == ID_DELETE && notification == BN_CLICKED) deleteSelected(s);
     else if (id == ID_UP && notification == BN_CLICKED) moveSelected(s, true);
     else if (id == ID_DOWN && notification == BN_CLICKED) moveSelected(s, false);
+    else if (id == ID_RUN && notification == BN_CLICKED) {
+        if (!s.dirty && s.selected && isRunnableNode(s.selected->kind) &&
+            s.selected->commandIndex >= 0 && s.context.runSelectedItem)
+            s.context.runSelectedItem(static_cast<size_t>(s.selected->commandIndex));
+    }
     else if (id == ID_SAVE_REBUILD && notification == BN_CLICKED) {
         clearEditorStatus(s);
         std::wstring error;
@@ -2295,7 +2681,10 @@ static void onCommand(EditorState& s, int id, int notification)
         updateIconPreview(s);
         s.dirty = true;
     } else if (id == ID_ICON_FOLDER_OPEN && notification == BN_CLICKED) openFolder(s, s.iconFolder);
-    else if (id == ID_TITLE && notification == EN_CHANGE && !s.updating) {
+    else if (id == ID_SCRIPT && notification == EN_CHANGE && !s.updating) {
+        invalidateHtmlAuthorizationIfFolderChanged(s);
+        s.dirty = true;
+    } else if (id == ID_TITLE && notification == EN_CHANGE && !s.updating) {
         s.dirty = true;
         SetTimer(s.hwnd, TITLE_REFRESH_TIMER, 180, nullptr);
     } else if (id == ID_TITLE && notification == EN_KILLFOCUS && !s.updating) {
@@ -2529,7 +2918,7 @@ static void layoutPageForms(EditorState& s)
     const LONG pageBottom = settingsPage.bottom ? settingsPage.bottom : itemBottom;
     RECT itemRegion{std::max(itemLeft, pageLeft), std::max(itemTop, pageTop),
                     std::min(itemRight, pageRight), std::min(itemBottom, pageBottom)};
-    for (HWND form : {s.emptyForm, s.scriptForm, s.actionForm, s.executeForm,
+    for (HWND form : {s.emptyForm, s.scriptForm, s.htmlForm, s.actionForm, s.executeForm,
                       s.submenuForm, s.separatorForm})
         layoutPageForm(s, form, itemRegion, itemRegion.left);
     layoutPageForm(s, s.settingsForm, settingsPage, settingsPage.left);
@@ -2544,6 +2933,7 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         s->hwnd = hwnd;
         s->emptyForm = createPageForm(*s, IDD_ITEM_EMPTY);
         s->scriptForm = createPageForm(*s, IDD_ITEM_SCRIPT);
+        s->htmlForm = createPageForm(*s, IDD_ITEM_HTML);
         s->actionForm = createPageForm(*s, IDD_ITEM_ACTION);
         s->executeForm = createPageForm(*s, IDD_ITEM_EXECUTE);
         s->submenuForm = createPageForm(*s, IDD_ITEM_SUBMENU);
@@ -2567,6 +2957,7 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         tabText = tr(*s, "ConfigTabSettings"); tabItem.pszText = const_cast<wchar_t*>(tabText.c_str());
         SendMessageW(s->tab, TCM_INSERTITEMW, 1, reinterpret_cast<LPARAM>(&tabItem));
         s->newButton = control(*s, L"BUTTON", tr(*s, "ConfigNew"), 0, 0, 0, 0, 0, ID_NEW);
+        s->runButton = control(*s, L"BUTTON", tr(*s, "ConfigRun"), 0, 0, 0, 0, 0, ID_RUN);
         s->deleteButton = control(*s, L"BUTTON", tr(*s, "ConfigDelete"), 0, 0, 0, 0, 0, ID_DELETE);
         s->upButton = control(*s, L"BUTTON", tr(*s, "ConfigMoveUp"), 0, 0, 0, 0, 0, ID_UP);
         s->downButton = control(*s, L"BUTTON", tr(*s, "ConfigMoveDown"), 0, 0, 0, 0, 0, ID_DOWN);
@@ -2586,12 +2977,12 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         };
         HWND layoutHeader = GetDlgItem(hwnd, ID_HEADER);
         if (layoutHeader) ShowWindow(layoutHeader, SW_HIDE);
-        for (HWND form : {s->emptyForm, s->scriptForm, s->actionForm, s->executeForm,
+        for (HWND form : {s->emptyForm, s->scriptForm, s->htmlForm, s->actionForm, s->executeForm,
                           s->submenuForm, s->separatorForm})
             registerHeader(form, "ConfigItemSettings");
         registerItemForm(s->emptyForm, ID_INFO);
         registerItemForm(s->separatorForm, ID_INFO);
-        for (HWND form : {s->scriptForm, s->submenuForm, s->actionForm, s->executeForm}) {
+        for (HWND form : {s->scriptForm, s->htmlForm, s->submenuForm, s->actionForm, s->executeForm}) {
             registerItemForm(form, ID_TITLE_LABEL, tr(*s, "ConfigTitleLabel"));
             registerItemForm(form, ID_TITLE);
             if (form != s->submenuForm) {
@@ -2599,12 +2990,25 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
                 registerItemForm(form, ID_SHORTCUT);
                 registerItemForm(form, ID_SHORTCUT_CLEAR, L"×");
             }
-            if (form == s->scriptForm) {
-                registerItemForm(form, ID_SCRIPT_LABEL, tr(*s, "ConfigScriptFile"));
+            if (form == s->scriptForm || form == s->htmlForm) {
+                registerItemForm(form, ID_SCRIPT_LABEL, tr(*s, form == s->htmlForm ? "ConfigHtmlFolder" : "ConfigScriptFile"));
                 registerItemForm(form, ID_SCRIPT);
                 registerItemForm(form, ID_SCRIPT_BROWSE, tr(*s, "ConfigBrowse"));
                 registerItemForm(form, ID_SCRIPT_EDIT, tr(*s, "ConfigEditScript"));
-                s->scriptHelpText = GetDlgItem(form, ID_SCRIPT_HELP_RICH_EDIT);
+                if (form == s->htmlForm)
+                {
+                    s->htmlHelpText = GetDlgItem(form, ID_HTML_HELP_RICH_EDIT);
+                    s->htmlAdvancedEnable = GetDlgItem(form, ID_HTML_ADVANCED_ENABLE);
+                    s->htmlAuthModeGroup = GetDlgItem(form, ID_HTML_AUTH_MODE_GROUP);
+                    s->htmlAuthReconfirm = GetDlgItem(form, ID_HTML_AUTH_RECONFIRM);
+                    s->htmlAuthTrustFolder = GetDlgItem(form, ID_HTML_AUTH_TRUST_FOLDER);
+                    SetWindowTextW(s->htmlAdvancedEnable, tr(*s, "ConfigHtmlAdvancedPermissions").c_str());
+                    SetWindowTextW(s->htmlAuthModeGroup, tr(*s, "ConfigHtmlAuthorizationMode").c_str());
+                    SetWindowTextW(s->htmlAuthReconfirm, tr(*s, "ConfigHtmlReconfirm").c_str());
+                    SetWindowTextW(s->htmlAuthTrustFolder, tr(*s, "ConfigHtmlTrustFolder").c_str());
+                }
+                else
+                    s->scriptHelpText = GetDlgItem(form, ID_SCRIPT_HELP_RICH_EDIT);
             } else if (form == s->actionForm) {
                 registerItemForm(form, ID_ACTION_LABEL, tr(*s, "ConfigAction"));
                 registerItemForm(form, ID_ACTION);
@@ -2634,7 +3038,7 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
                                               WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
                                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
                                               hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-        for (HWND form : {s->scriptForm, s->actionForm, s->executeForm, s->submenuForm}) {
+        for (HWND form : {s->scriptForm, s->htmlForm, s->actionForm, s->executeForm, s->submenuForm}) {
             HWND shortcut = GetDlgItem(form, ID_SHORTCUT);
             if (shortcut && s->shortcutTooltip) {
                 TOOLINFOW tool{};
@@ -2700,11 +3104,12 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         refreshSettingsPaths(*s);
 
         // Keep horizontal text margins consistent across standard EDIT fields.
-        for (HWND form : {s->scriptForm, s->actionForm, s->executeForm, s->submenuForm}) {
+        for (HWND form : {s->scriptForm, s->htmlForm, s->actionForm, s->executeForm, s->submenuForm}) {
             setEditTextMargins(GetDlgItem(form, ID_TITLE), 0, 0);
             setEditTextMargins(GetDlgItem(form, ID_SHORTCUT), 0, 0);
         }
         setEditTextMargins(GetDlgItem(s->scriptForm, ID_SCRIPT), 0, 0);
+        setEditTextMargins(GetDlgItem(s->htmlForm, ID_SCRIPT), 0, 0);
         setEditTextMargins(GetDlgItem(s->actionForm, ID_ACTION_TARGET), 0, 0);
         for (int id : {ID_WORKSPACE_PATH, ID_MENU_JSON_PATH, ID_SCRIPT_FOLDER_PATH, ID_ICON_FOLDER_PATH})
             setEditTextMargins(GetDlgItem(s->settingsForm, id), 0, 0);
@@ -2715,11 +3120,12 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
             setEditTextMargins(codePageCombo.hwndItem, 0, 0);
             setMultilineTextOrigin(codePageCombo.hwndItem, 2, 1);
         }
-        for (HWND form : {s->scriptForm, s->submenuForm, s->actionForm, s->executeForm}) {
+        for (HWND form : {s->scriptForm, s->htmlForm, s->submenuForm, s->actionForm, s->executeForm}) {
             setMultilineTextOrigin(GetDlgItem(form, ID_TITLE), 2, 1);
             setMultilineTextOrigin(GetDlgItem(form, ID_SHORTCUT), 2, 1);
         }
         setMultilineTextOrigin(GetDlgItem(s->scriptForm, ID_SCRIPT), 2, 1);
+        setMultilineTextOrigin(GetDlgItem(s->htmlForm, ID_SCRIPT), 2, 1);
         setMultilineTextOrigin(GetDlgItem(s->actionForm, ID_ACTION_TARGET), 2, 1);
         for (int id : {ID_WORKSPACE_PATH, ID_MENU_JSON_PATH, ID_SCRIPT_FOLDER_PATH, ID_ICON_FOLDER_PATH})
             setMultilineTextOrigin(GetDlgItem(s->settingsForm, id), 2, 1);
@@ -2740,6 +3146,9 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
             {{tr(*s, "ConfigScriptHelpRuntime"), s->context.scriptRequirementsUrl},
              {tr(*s, "ConfigScriptHelpCreate"), s->context.scriptTemplateUrl},
              {tr(*s, "ConfigScriptHelpApi"), s->context.scriptApiUrl}}, 100);
+        setRichHelpContent(*s, s->htmlHelpText,
+            {{tr(*s, "ConfigHtmlHelp"), L""},
+             {tr(*s, "ConfigHtmlPermissionsHelp"), s->context.htmlPermissionsUrl}}, 100);
         setRichHelpContent(*s, s->actionHelpText,
             {{tr(*s, "ConfigActionHelpHeading"), L""},
              {tr(*s, "ConfigActionHelpCurrentFile"), L""},
@@ -2814,8 +3223,8 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
     }
     if (!s) return FALSE;
     if (message == TITLE_REFRESH_MESSAGE) {
-        if (!s->selected) return TRUE;
-        if (commitSelected(*s)) refreshSelectedTreeItemTitle(*s);
+        if (s->selected && commitSelected(*s)) refreshSelectedTreeItemTitle(*s);
+        updateRunButton(*s);
         return TRUE;
     }
     if (message == WM_DRAWITEM &&
@@ -2880,6 +3289,21 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         reinterpret_cast<NMHDR*>(lParam)->code == NM_RCLICK) {
         POINT screen{};
         if (GetCursorPos(&screen)) showTreeContextMenu(*s, screen);
+        return TRUE;
+    }
+    if (message == WM_NOTIFY && reinterpret_cast<NMHDR*>(lParam)->idFrom == ID_TREE &&
+        reinterpret_cast<NMHDR*>(lParam)->code == TVN_ITEMEXPANDEDW) {
+        const auto* expanded = reinterpret_cast<const NMTREEVIEWW*>(lParam);
+        EditorNode* node = reinterpret_cast<EditorNode*>(expanded->itemNew.lParam);
+        if (node && (node->kind == NodeKind::TopMenu || node->kind == NodeKind::Submenu)) {
+            const int image = (expanded->action == TVE_EXPAND) ? 7 : 0;
+            TVITEMW update{};
+            update.mask = TVIF_HANDLE | TVIF_IMAGE | TVIF_SELECTEDIMAGE;
+            update.hItem = expanded->itemNew.hItem;
+            update.iImage = image;
+            update.iSelectedImage = image;
+            TreeView_SetItem(s->tree, &update);
+        }
         return TRUE;
     }
     if (message == WM_NOTIFY && reinterpret_cast<NMHDR*>(lParam)->idFrom == ID_TREE &&
@@ -2954,15 +3378,67 @@ static INT_PTR CALLBACK dialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
                           nullptr, nullptr, SW_SHOWNORMAL);
             return TRUE;
         }
+        if (id == ID_HTML_ADVANCED_ENABLE && notification == BN_CLICKED) {
+            const bool requested =
+                IsDlgButtonChecked(s->htmlForm, ID_HTML_ADVANCED_ENABLE) == BST_CHECKED;
+            if (requested) {
+                const std::wstring folder = canonicalHtmlFolderPath(
+                    resolvedPath(s->workspaceFolder, readText(s->script)));
+                std::wstring currentHash;
+                const bool hasIndex = !folder.empty() && htmlFolderHasIndex(folder);
+                const INT_PTR result = hasIndex ? showHtmlPermissionPreview(*s) : IDCANCEL;
+                const bool acceptedForPreview = result == IDOK && hasIndex;
+                if (acceptedForPreview) {
+                    s->htmlAuthorizationConfirmed = true;
+                    s->htmlAuthorizedFolder = folder;
+                    if (IsDlgButtonChecked(s->htmlForm, ID_HTML_AUTH_TRUST_FOLDER) != BST_CHECKED &&
+                        !htmlFolderSha256(folder, currentHash)) {
+                        s->htmlAuthorizationConfirmed = false;
+                        s->htmlAuthorizedFolder.clear();
+                        currentHash.clear();
+                        CheckDlgButton(s->htmlForm, ID_HTML_ADVANCED_ENABLE, BST_UNCHECKED);
+                        MessageBoxW(hwnd, tr(*s, "ConfigHtmlIndexMissing").c_str(),
+                                    L"NppMenuScripts", MB_OK | MB_ICONWARNING);
+                    }
+                    s->htmlAuthorizedSha256 = currentHash;
+                } else {
+                    s->htmlAuthorizationConfirmed = false;
+                    s->htmlAuthorizedFolder.clear();
+                    s->htmlAuthorizedSha256.clear();
+                    if (!hasIndex)
+                        MessageBoxW(hwnd, tr(*s, "ConfigHtmlIndexMissing").c_str(),
+                                    L"NppMenuScripts", MB_OK | MB_ICONWARNING);
+                }
+                CheckDlgButton(s->htmlForm, ID_HTML_ADVANCED_ENABLE,
+                               acceptedForPreview && s->htmlAuthorizationConfirmed ? BST_CHECKED : BST_UNCHECKED);
+                updateHtmlAuthorizationOptions(*s, acceptedForPreview && s->htmlAuthorizationConfirmed);
+            } else {
+                s->htmlAuthorizationConfirmed = false;
+                s->htmlAuthorizedFolder.clear();
+                s->htmlAuthorizedSha256.clear();
+                updateHtmlAuthorizationOptions(*s, false);
+            }
+            s->dirty = true;
+            updateRunButton(*s);
+            return TRUE;
+        }
+        if ((id == ID_HTML_AUTH_RECONFIRM || id == ID_HTML_AUTH_TRUST_FOLDER) &&
+            notification == BN_CLICKED) {
+            s->dirty = true;
+            updateRunButton(*s);
+            return TRUE;
+        }
         if (id == ID_ACTION && notification == CBN_SELCHANGE) {
             const int kind = static_cast<int>(SendMessageW(s->action, CB_GETITEMDATA, SendMessageW(s->action, CB_GETCURSEL, 0, 0), 0));
-            showActionTargetControls(*s, kind == 3); s->dirty = true; return TRUE;
+            showActionTargetControls(*s, kind == 3); s->dirty = true; updateRunButton(*s); return TRUE;
         }
         onCommand(*s, id, notification);
+        updateRunButton(*s);
         return TRUE;
     }
     if (message == WM_CLOSE) { onCommand(*s, ID_CANCEL, BN_CLICKED); return TRUE; }
     if (message == WM_DESTROY) {
+        savePersistentTreeExpansion(*s);
         if (s->shortcutTooltip) { DestroyWindow(s->shortcutTooltip); s->shortcutTooltip = nullptr; }
         if (s->shortcutClearFont) { DeleteObject(s->shortcutClearFont); s->shortcutClearFont = nullptr; }
         if (s->customIcon) { DestroyIcon(s->customIcon); s->customIcon = nullptr; }
@@ -2993,6 +3469,7 @@ MenuConfigEditorResult showMenuConfigEditor(const MenuConfigEditorContext& conte
 {
     EditorState state;
     state.context = context;
+    loadPersistentTreeExpansion(state);
     state.iconFolder = context.iconFolder;
     state.scriptFolder = context.scriptFolder;
     state.root = loadJson(context.menuPath);

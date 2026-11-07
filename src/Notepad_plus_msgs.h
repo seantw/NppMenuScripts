@@ -43,3 +43,5 @@ struct toolbarIconsWithDarkMode {
 #define NPPM_DMMSHOW (NPPMSG + 30)
 #define NPPM_DMMHIDE (NPPMSG + 31)
 #define NPPM_DMMUPDATEDISPINFO (NPPMSG + 32)
+#define DMN_FIRST 1050
+#define DMN_CLOSE (DMN_FIRST + 1)

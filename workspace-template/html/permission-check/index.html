@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HTML Permission Check</title>
+  <style>
+    body { max-width: 760px; margin: 2rem auto; padding: 0 1rem; font: 16px/1.5 "Segoe UI", sans-serif; color: #202124; }
+    h1 { color: #1769aa; }
+    section { border: 1px solid #ccd3da; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+    button { margin: .25rem; padding: .5rem .8rem; }
+    output { display: block; min-height: 1.5em; margin-top: .5rem; color: #444; white-space: pre-wrap; }
+    .note { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>HTML Permission Check</h1>
+  <p class="note">Each test runs only after you click its button. This sample starts without advanced permission. Use the HTML item's settings to grant it, then run the tests again to compare results. A failed request may also be caused by network or browser settings.</p>
+  <section>
+    <h2>External connection</h2>
+    <button onclick="testRemoteImage()">Load a remote image</button>
+    <output id="network-result">No request made.</output>
+    <img id="remote-image" alt="Remote test image" hidden>
+  </section>
+  <section>
+    <h2>Local file URL (file://)</h2>
+    <label for="file-url">Existing local file URL:</label>
+    <input id="file-url" type="url" value="file:///C:/Windows/win.ini" size="48">
+    <button onclick="testLocalFileUrl()">Try to access the file</button>
+    <output id="file-url-result">No request made.</output>
+    <p class="note">Change the URL if Windows is installed on another drive. This test reports whether the request is blocked and never displays the file contents.</p>
+  </section>
+  <section>
+    <h2>External navigation and pop-up</h2>
+    <button onclick="location.href='https://example.com/'">Navigate this pane to example.com</button>
+    <button onclick="window.open('https://example.com/', '_blank', 'width=700,height=500')">Open example.com in a new window</button>
+    <p class="note">If navigation leaves this page, choose this HTML item again from the NppMenuScripts menu to return.</p>
+  </section>
+  <section>
+    <h2>Permission request</h2>
+    <button onclick="requestLocation()">Request location</button>
+    <output id="location-result">No permission requested.</output>
+    <p class="note">NppMenuScripts does not automatically grant location access. WebView2 may ask for permission, and access depends on the user's choice and Windows location settings.</p>
+  </section>
+  <section>
+    <h2>Notepad++ communication</h2>
+    <button onclick="readSelection()">Read current selection</button>
+    <output id="bridge-result">No request made.</output>
+  </section>
+  <section>
+    <h2>Download</h2>
+    <a download="nppmenuscripts-permission-test.txt" href="data:text/plain,Permission%20test%20download">Download a small test file</a>
+    <p class="note">The file is created only when you click the link.</p>
+  </section>
+  <script>
+    function testRemoteImage() {
+      const image = document.getElementById('remote-image');
+      const result = document.getElementById('network-result');
+      result.textContent = 'Requesting https://www.google.com/favicon.ico ...';
+      image.hidden = false;
+      image.onload = () => { result.textContent = 'Remote image loaded.'; };
+      image.onerror = () => { result.textContent = 'Request blocked or unavailable. Check network access too.'; };
+      image.src = 'https://www.google.com/favicon.ico?test=' + Date.now();
+    }
+    async function testLocalFileUrl() {
+      const url = document.getElementById('file-url').value.trim();
+      const result = document.getElementById('file-url-result');
+      if (!url.toLowerCase().startsWith('file://')) {
+        result.textContent = 'Enter a file:// URL.';
+        return;
+      }
+      result.textContent = 'Trying to access the local file ...';
+      try {
+        const response = await fetch(url);
+        result.textContent = response.ok
+          ? 'The request succeeded. This environment did not block this file URL.'
+          : 'The request was not successful (HTTP ' + response.status + ').';
+      } catch (e) {
+        result.textContent = 'Access blocked or unavailable: ' + e.message;
+      }
+    }
+    function requestLocation() {
+      const result = document.getElementById('location-result');
+      if (!navigator.geolocation) { result.textContent = 'Geolocation is unavailable.'; return; }
+      result.textContent = 'Waiting for the browser permission and location result ...';
+      navigator.geolocation.getCurrentPosition(
+        p => { result.textContent = 'Location permission granted. Coordinates: ' + p.coords.latitude.toFixed(3) + ', ' + p.coords.longitude.toFixed(3); },
+        e => { result.textContent = 'Denied or unavailable: ' + e.message; },
+        { timeout: 8000 }
+      );
+    }
+    async function readSelection() {
+      const result = document.getElementById('bridge-result');
+      if (!window.npp) { result.textContent = 'Npp API is unavailable while advanced permission is off.'; return; }
+      try { result.textContent = 'Selected text: ' + JSON.stringify(await npp.getSelection()); }
+      catch (e) { result.textContent = 'Npp API request failed: ' + e.message; }
+    }
+  </script>
+</body>
+</html>

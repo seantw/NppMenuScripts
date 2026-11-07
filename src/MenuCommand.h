@@ -6,6 +6,7 @@
 enum class MenuCommandAction {
     RunScript,
     RunCommand,
+    OpenHtml,
     RunCurrentFile,
     StopScript,
     ConfigureMenu,
@@ -25,6 +26,12 @@ constexpr bool hasExactlyOneExecutionTarget(bool hasScript, bool hasAction, bool
 {
     return static_cast<unsigned int>(hasScript) + static_cast<unsigned int>(hasAction) +
            static_cast<unsigned int>(hasExecute) == 1;
+}
+
+constexpr bool hasExactlyOneExecutionTarget(bool hasScript, bool hasAction, bool hasExecute, bool hasHtml)
+{
+    return static_cast<unsigned int>(hasScript) + static_cast<unsigned int>(hasAction) +
+           static_cast<unsigned int>(hasExecute) + static_cast<unsigned int>(hasHtml) == 1;
 }
 
 inline bool parseActionToken(std::wstring_view value, MenuCommandAction& action, std::wstring& target)

@@ -12,6 +12,7 @@ struct MenuConfigEditorContext {
     HWND owner = nullptr;
     HINSTANCE module = nullptr;
     std::wstring menuPath;
+    std::wstring settingsFilePath;
     std::wstring workspaceFolder;
     std::wstring scriptFolder;
     std::wstring iconFolder;
@@ -19,12 +20,14 @@ struct MenuConfigEditorContext {
     std::wstring scriptRequirementsUrl;
     std::wstring scriptTemplateUrl;
     std::wstring scriptApiUrl;
+    std::wstring htmlPermissionsUrl;
     std::wstring initialStatus;
     std::function<std::wstring(const char*)> translate;
     std::function<bool(cJSON*, std::wstring&)> validate;
     std::function<bool(std::wstring&, std::wstring&)> saveAndRebuild;
     std::function<bool(HWND, std::wstring&)> chooseWorkspaceFolder;
     std::function<bool(HWND, const std::wstring&)> openOrCreateScript;
+    std::function<void(size_t)> runSelectedItem;
 };
 
 MenuConfigEditorResult showMenuConfigEditor(const MenuConfigEditorContext& context,

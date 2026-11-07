@@ -9,7 +9,7 @@ NppMenuScripts is an x64 plugin for Notepad++. It lets you configure menus and t
 - Configure menus and toolbars, and assign actions to their items.
 - Menus support nested submenus up to 16 levels, excluding the root menu.
 - Up to 32 toolbar buttons can use custom icons.
-- Actions fall into three categories:
+- Actions fall into four categories:
   - **Scripts**: JavaScript, Python, and Perl are supported. Helper API modules are available for all three languages to interact with the active document. Even without the Helper API, script `stdout` and `stderr` are displayed in the Output Pane. Basic ANSI color codes are supported.
   - **Built-in plugin actions**: Run the script currently open in the editor, or stop a running script.
   - **External programs (command line)**:
@@ -18,6 +18,7 @@ NppMenuScripts is an x64 plugin for Notepad++. It lets you configure menus and t
     - Set the text encoding used by the Output Pane.
     - Pass file path and name placeholders as command-line arguments.
     - Set environment variables for the process, including placeholders for parts of the active document.
+  - **HTML projects**: Load an HTML project in a dockable WebView2 pane.
 - Scripts run in separate processes. Each process exits and releases its resources when it finishes. No script runtime stays resident when no script is running. Running script processes are also cleaned up when Notepad++ shuts down.
 - The interface supports multiple languages.
 
@@ -25,6 +26,7 @@ NppMenuScripts is an x64 plugin for Notepad++. It lets you configure menus and t
 
 - Windows x64
 - Notepad++ x64
+- For HTML projects, Microsoft Edge WebView2 Runtime is required. It is included with Windows 11; on other Windows versions, it may already be installed. If it is missing, install it from [Microsoft's WebView2 page](https://developer.microsoft.com/en-us/microsoft-edge/webview2/).
 - For JavaScript, install [Node.js® for Windows](https://nodejs.org/en/download/).
 - For Python, install [Python for Windows](https://www.python.org/downloads/windows/).
 - For Perl, install [Strawberry Perl for Windows](https://strawberryperl.com/).
@@ -118,7 +120,7 @@ If you change `script_folder`, copy `menu-helper.js` and `package.json` to its p
 - Use an empty object `{}` for a menu separator.
 - Each menu item and toolbar item must have a `title` and one action:
   - `title` (required): The menu item label or toolbar button tooltip. To assign a keyboard shortcut, append a **tab character** `\t` followed by the shortcut name.
-  - Choose exactly one of `script`, `action`, or `execute`:
+  - Choose exactly one of `script`, `action`, `execute`, or `html`:
     - `script`: A script file path, relative to `script_folder` or absolute. Supported extensions are `.js`, `.mjs`, `.py`, and `.pl`.
     - `action`: A built-in plugin action or Notepad++ menu command. The available actions are:
       - `"RUN_CURRENT_FILE"` runs the script currently open in the editor.
@@ -142,6 +144,7 @@ If you change `script_folder`, copy `menu-helper.js` and `package.json` to its p
         - `{SCRIPT_FOLDER}`: Full path to the script folder configured by `script_folder`
         - `{LINE_TEXT}`: Text on the current line (available in `env` only)
         - `{SELECT_TEXT}`: Selected text (available in `env` only)
+    - `html`: The path to an HTML project folder containing `index.html`, relative to the folder containing `menu.json` or absolute.
   - `icon`: A toolbar button icon file in `.ico` format, 32×32 pixels with 32-bit color depth (full color and transparency). This property only applies to `toolbar` items.
   - `sub`: An array of submenu items, which can contain nested submenus or script items. This property only applies to `menu` items.
 
@@ -303,6 +306,38 @@ To provide `icon` while omitting earlier optional parameters, pass `undefined` i
 - Boolean values are returned as `True`/`False` in Python and `1`/`0` in Perl.
 - The Helper API is synchronous in all supported languages. JavaScript also provides asynchronous calls.
 - File paths accept either `\` or `/` as separators. Escape backslashes as `\\` when writing them in strings.
+
+## HTML projects
+
+An HTML item loads a project folder containing `index.html` in a dockable WebView2 pane:
+
+```json
+{ "title": "My HTML Tool", "html": "./html/my-tool" }
+```
+
+### JavaScript API
+
+When advanced permissions are enabled for the HTML folder, the page can use the asynchronous `npp` API to interact with the current Notepad++ document and clipboard:
+
+```js
+const text = await npp.getText();
+const selectedText = await npp.getSelection();
+await npp.setSelection("replacement");
+```
+
+Available methods: `getText()`, `setText(text)`, `getSelection()`, `setSelection(text)`, `getClipBoard()`, and `setClipBoard(text)`. Each method returns a Promise.
+
+### Permissions
+
+For security, NppMenuScripts uses a strict permission-granting process. By default, changes to the HTML or its related files require you to grant permission again in the configuration window. If you need to make frequent changes during development, you can choose **Trust this folder** as the authorization method.
+
+![HTML permission settings](screenshot/permission.png)
+
+By default, the HTML page can run JavaScript and access files served from its project folder. Requests to physical files through `file://`, external network access, external page navigation, pop-up windows, downloads, browser permission requests, and communication with Notepad++ are blocked.
+
+Advanced permissions can be explicitly granted to a trusted HTML folder. They relax the restrictions above, allowing external requests and navigation, pop-ups and downloads, WebView2 permission requests, and the `npp` API. Access through `file://` may also be possible, subject to WebView2 restrictions. Do not grant advanced permissions to HTML content you do not trust.
+
+The browser `localStorage` API is available for saving small amounts of data, such as preferences. NppMenuScripts HTML items share the same WebView2 origin and therefore share the same `localStorage` area.
 
 ## Multilingual support
 

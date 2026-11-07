@@ -61,6 +61,12 @@
           }
         ]
       },
+      {
+        "title": "HTML Tests",
+        "sub": [
+          { "title": "Permission Check", "html": "./html/permission-check" }
+        ]
+      },
       {},
       { "title": "Run Current Script", "action": "RUN_CURRENT_FILE" }
     ]
