@@ -1319,7 +1319,7 @@ static void configureMenu()
     context.scriptRequirementsUrl = readme + (chineseReadme ? L"#系統需求" : L"#requirements");
     context.scriptTemplateUrl = readme + (chineseReadme ? L"#api-參考" : L"#api-reference");
     context.scriptApiUrl = readme + (chineseReadme ? L"#腳本語言" : L"#script-languages");
-    context.htmlPermissionsUrl = readme;
+    context.htmlPermissionsUrl = readme + (chineseReadme ? L"#權限" : L"#permissions");
     context.chooseWorkspaceFolder = chooseWorkspaceFolder;
     context.openOrCreateScript = [](HWND owner, const std::wstring& path) { return openOrCreateScript(path, owner); };
     context.runSelectedItem = [](size_t index) {
