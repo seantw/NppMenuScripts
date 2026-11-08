@@ -1309,10 +1309,10 @@ static void configureMenu()
     context.settingsFilePath = settingsFilePath();
     context.translate = [](const char* key) { return tr(key); };
     const std::wstring locale = nativeLocaleCode();
-    context.placeholdersUrl = (locale == L"zh-TW" || locale == L"zh-CN")
+    context.placeholdersUrl = (locale == L"zh-tw" || locale == L"zh-cn")
         ? L"https://github.com/seantw/NppMenuScripts/blob/main/README.zh-TW.md#command-env-placeholders"
         : L"https://github.com/seantw/NppMenuScripts/blob/main/README.md#command-env-placeholders";
-    const bool chineseReadme = locale == L"zh-TW" || locale == L"zh-CN";
+    const bool chineseReadme = locale == L"zh-tw" || locale == L"zh-cn";
     const std::wstring readme = chineseReadme
         ? L"https://github.com/seantw/NppMenuScripts/blob/main/README.zh-TW.md"
         : L"https://github.com/seantw/NppMenuScripts/blob/main/README.md";

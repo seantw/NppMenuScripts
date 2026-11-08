@@ -2,7 +2,7 @@
 
 **English** | [中文](README.zh-TW.md)
 
-NppMenuScripts is an x64 plugin for Notepad++. It lets you configure menus and toolbars to run your own scripts or commands.
+NppMenuScripts is an x64 plugin for Notepad++. It lets you configure menus and toolbars to run your own scripts, load HTML projects, or execute commands.
 
 ## Features
 
@@ -11,7 +11,7 @@ NppMenuScripts is an x64 plugin for Notepad++. It lets you configure menus and t
 - Up to 32 toolbar buttons can use custom icons.
 - Actions fall into four categories:
   - **Scripts**: JavaScript, Python, and Perl are supported. Helper API modules are available for all three languages to interact with the active document. Even without the Helper API, script `stdout` and `stderr` are displayed in the Output Pane. Basic ANSI color codes are supported.
-  - **Built-in plugin actions**: Run the script currently open in the editor, or stop a running script.
+  - **Built-in plugin actions**: Run the script currently open in the editor, stop a running script, run a menu command, or open Menu Configuration.
   - **External programs (command line)**:
     - Options include running a command in the Output Pane, in a Windows Console window, or as a Windows application.
     - Optionally save the active document before running.
