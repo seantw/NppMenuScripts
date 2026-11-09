@@ -2,7 +2,7 @@
 
 [English](README.md) | **中文**
 
-NppMenuScripts 是 Notepad++ 的 x64 外掛程式。它可讓您自訂「選單」或「工具列」，並透過這些項目執行自行撰寫的「腳本語言」、「HTML 應用程式」或「命令」。
+NppMenuScripts 是 Notepad++ 的 x64 外掛程式，可讓您自訂「選單／工具列」、執行自行撰寫的 JavaScript、Python、Perl 或 HTML，並執行外部命令。
 
 
 ## 功能概述

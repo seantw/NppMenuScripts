@@ -218,8 +218,8 @@ FONT 9, "MS Shell Dlg", 0, 0, 1
 222 ICON "res/reload.ico"
 
 1 VERSIONINFO
-FILEVERSION     1, 2, 0, 0
-PRODUCTVERSION  1, 2, 0, 0
+FILEVERSION     1, 2, 1, 0
+PRODUCTVERSION  1, 2, 1, 0
 FILEOS          VOS_NT_WINDOWS32
 FILETYPE        VFT_DLL
 FILEFLAGSMASK   VS_FF_SPECIALBUILD | VS_FF_INFOINFERRED | VS_FF_PRIVATEBUILD | VS_FF_PATCHED | VS_FF_PRERELEASE | VS_FF_DEBUG
@@ -231,12 +231,12 @@ FILEFLAGS       0
         {
             VALUE "CompanyName", "Sean Lin"
             VALUE "FileDescription", "NppMenuScripts Notepad++ plugin"
-            VALUE "FileVersion", "1.2.0.0"
+            VALUE "FileVersion", "1.2.1.0"
             VALUE "InternalName", "NppMenuScripts"
             VALUE "LegalCopyright", "Copyright (c) 2026 Sean Lin"
             VALUE "OriginalFilename", "NppMenuScripts.dll"
             VALUE "ProductName", "NppMenuScripts"
-            VALUE "ProductVersion", "1.2.0.0"
+            VALUE "ProductVersion", "1.2.1.0"
         }
     }
     BLOCK "VarFileInfo"

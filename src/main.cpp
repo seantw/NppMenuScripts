@@ -5695,6 +5695,17 @@ static bool installMenus(const std::wstring& jsonPath, bool forceRebuild)
         if (!sub || !addJsonMenu(sub, top, folder)) {
             if (sub) DestroyMenu(sub); cJSON_Delete(root); removeMenus(); return false;
         }
+        // setInfo() runs while Notepad++ is still loading plugins, before it
+        // finishes initializing and caches its native Window menu. Parse the
+        // configuration now so getFuncsArray() can expose toolbar commands,
+        // but do not mutate the main menu until NPPN_READY. That notification
+        // triggers a forced rebuild after Notepad++ has finished initialization.
+        if (!g_nppReady) {
+            DestroyMenu(sub);
+            debugLog(L"Deferring custom main-menu insertion until NPPN_READY title='" +
+                     titleWithoutShortcut(utf8ToWide(top->string)) + L"'");
+            continue;
+        }
         const std::wstring title = titleWithoutShortcut(utf8ToWide(top->string));
         const BOOL inserted = helpMenuPosition >= 0
             ? InsertMenuW(g_mainMenu, static_cast<UINT>(helpMenuPosition),
